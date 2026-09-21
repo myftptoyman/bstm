@@ -6,7 +6,7 @@
 | `rename/rn_rename.v`  | `rn_rename` | RAT + committed-RAT + freelist，4-wide rename |
 
 埠列由監督者凍結，本次只填 body。語言 Verilog-2005，遵守 `CONTRACT.md §1` 五條硬規則。
-介面版本：**ifc.vh v3**（`RUOP_W` 40 bit，新增 `RUOP_ARFD/ARFDV`；commit 送新 mapping
+介面版本：**ifc.vh v3 + PRF 參數化**（`RUOP_W` 40 bit，新增 `RUOP_ARFD/ARFDV`；commit 送新 mapping
 `cmt_prf`；ready 為 all-or-nothing）。
 
 ---
@@ -18,8 +18,8 @@
 
 | top | cells | memories | latch | state bits |
 |---|---|---|---|---|
-| `fe_front`  | 449  | **0** | 無 | 617（dq 512 + 控制 9 + counter 96）|
-| `rn_rename` | 4761 | **0** | 無 | 560（RAT 192 + cRAT 192 + fl 64 + cfl 64 + counter 48）|
+| `fe_front`  | 484  | **0** | 無 | 666（dq 512 + 控制 10 + counter 144）|
+| `rn_rename` | 4789 | **0** | 無 | 608 宣告 / 594 實際（x0 的 RAT entry 與 phys0 的 freelist 位元是常數，被折掉）|
 
 `RUOP` v3（32 → 40 bit）對 cell 數**零影響**（4761 → 4761，只多 32 條 wire bit）：
 新欄位是 `DUOP_D/DUOP_DV` 的純接線複製，沒有新增任何邏輯。
@@ -71,6 +71,88 @@ verilator --binary -Wno-DECLFILENAME -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC \
 
 ---
 
+## 1b. PRF sweep 參數化（64 / 128 / 192 / 256）
+
+兩個模組的實體暫存器寬度與數量**全部走 `` `PRF_W `` / `` `PRF_N ``**，沒有任何硬編的
+6 或 64。RUOP 也改成**逐欄位填**（`ru[`RUOP_S1] = ...`）而不是位元連接，所以佈局產生器
+把 `RUOP_W` 從 40 改成 48、欄位整體位移、或留保留位元，本模組都不用改。
+
+scratch 路徑：`/tmp/agentd_prf/`（監督者分配）。
+
+| config | lint fe / rn | fe cells / flops | rn cells / flops | rn flop 預測 | 功能測試 |
+|---|---|---|---|---|---|
+| PRF_N=64  `PRF_W`=6 (RUOP_W 40) | 0 / 0 | 5155 / 666 | 13018 / **594** | 594 | 13/13 PASS |
+| PRF_N=128 `PRF_W`=7 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 20215 / **784** | 784 | 13/13 PASS |
+| PRF_N=192 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 27906 / **974** | 974 | 13/13 PASS |
+| PRF_N=256 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 34316 / **1102** | 1102 | 13/13 PASS |
+
+cells/flops 是 `proc; opt; check -assert; techmap; opt` 之後的 gate 數與 flop 數
+（techmap 後才數得到 flop 位元數）。四個 config 都是 **latch = 0、memories = 0**。
+`lint` 是 `verilator --lint-only -Wall` 的 warning+error 數。
+
+### flop 數的解析推導（不是只看 lint 過）
+
+```
+rn_rename flop = RAT(ARF_N x PRF_W) + cRAT(ARF_N x PRF_W) + fl(PRF_N) + cfl(PRF_N)
+                 + counter(48 x 2：cnt_st_rename 與 cnt_st_backpressure)
+               = 64*PRF_W + 2*PRF_N + 96
+   再扣掉常數折掉的部分：x0 的 RAT/cRAT entry（2 x PRF_W）與 phys0 的 fl/cfl 位元（2）
+               = 62*PRF_W + 2*PRF_N + 94
+```
+
+四個 config 的實測 flop 數與這條式子**逐一相符**（594 / 784 / 974 / 1102），
+所以寬度是真的打通到每一級，不是被靜默截斷。
+`fe_front` 完全不碰 PRF，四個 config 都是 **666 flop / 5155 gates 不變**
+（666 = decode queue 16x32 + 控制 10（含 refill_q）+ 三個 48-bit counter）
+—— 這也是它應該有的行為。
+
+每 +1 `PRF_W` → +62 flop（兩份 RAT）；每 +64 `PRF_N` → +128 flop（fl + cfl）。
+
+### 順手修掉的一個 sweep 殺手
+
+`fl_init` 原本是 `{{(`PRF_N/2){1'b1}}, {(`PRF_N/2){1'b0}}}`（一半可配、一半佔用）。
+這在 PRF_N=64 時碰巧正確（32 個架構 mapping），但 **PRF sweep 到 128/256 時會平白
+少掉一半可配的實體暫存器** —— 模型不會壞、不會 lint 出錯，只會安靜地跑出「PRF 加大
+效果打折」的假結論。已改成依架構暫存器數：
+
+```verilog
+wire [`PRF_N-1:0] fl_init = {{(`PRF_N-ARF_N){1'b1}}, {ARF_N{1'b0}}};
+```
+
+新增的 T11 就是在守這件事：flush 後連續配置直到 stall，累計配出的實體暫存器數
+必須**恰好等於 `PRF_N - 32`**（64→32、128→96、192→160、256→224，四個 config 都實測通過）。
+
+### 「碰巧是 6/5/4 但語意不同」的常數已具名
+
+避免下次有人用 regex 把 PRF 寬度一把掃掉：
+
+| 常數 | 值 | 語意 | sweep 時 |
+|---|---|---|---|
+| `ARFI_W` | 5 | 架構暫存器索引寬度（= `DUOP_D` 寬、ARF_N=32）| **不可**跟著 `PRF_W` 改 |
+| `CNT_B` | 6 | 48-bit counter 切成 6 段 8-bit 進位鏈 | **不可**跟著 `PRF_W` / `ROB_W` 改 |
+| `` `UC_W `` / `` `LAT_W `` | 4 | uop class / exec latency 欄位寬 | 走巨集 |
+| `ARF_N` | 32 | 架構暫存器數 | 獨立維度 |
+
+同類掃描（Agent F 抓到的兩種坑）在本模組**都沒有命中**：
+沒有 `[i*`MACRO +: 6]` 這種「起點走巨集、寬度寫死」的切片；
+沒有 `reg [31:0]` 的 RUOP_W 遺留（`fe_front` 用 `DQ_W = `DUOP_W`，
+`rn_rename` 用 `DW/RW`）。
+
+### 建議：加 `cfg_prf_entries`，PRF sweep 就能收進同一個 batch
+
+現在 PRF 是**編譯期**維度：四個尺寸要四份 netlist、四個 batch。
+若監督者願意在凍結埠列加一個 `input [8:0] cfg_prf_entries`，我這邊只需要
+**兩行**（`fl_init` 依 cfg 遮罩、配置時不選超出範圍的位元）就能把它變成
+契約規則 2 的 runtime mask，四個尺寸共用同一份 netlist。
+
+代價要講清楚：masking 之後**每個 instance 都要付 MAX（PRF_N=256）的成本**
+—— rn_rename 從 12787 gate 變成 34085 gate（2.7x），fe_front 不變。
+所以「一個 batch 但每個 instance 貴 2.7x」對上「四個 batch 但各自便宜」，
+划不划算取決於 batch 排程器怎麼填。若 sweep 點數會再長（例如同時掃 ROB），
+runtime mask 才明顯占上風。
+
+---
+
 ## 2. `fe_front` 設計
 
 ### 2.1 資料路徑
@@ -112,12 +194,33 @@ mux」，索引全是 genvar 常數，因此 Yosys 不會推斷出任何記憶�
 - `mispred_in` 與 `flush` 在 `top.v` 接同一條線（監督者已確認語意）：
   `mispred_in` 用來「回正確路徑」，`flush` 用來「清 decode queue」。
 
-### 2.4 counter 語意
+### 2.4 counter 語意與 stall 歸因
 
-| 埠 | 定義 |
-|---|---|
-| `cnt_st_fetch` | `de_ready & (de_valid == 0) & ~flush` 的 cycle 數：**下游收得下、但前端一條 uop 都交不出來**的拍數（含 I-cache 泡泡、斷流、flush 後重填）。**不含**「交得出但不足 4 條」的部分斷流。 |
-| `cnt_mispred` | 前端偵測到的方向誤預測次數（= 切 shadow 的次數）。監督者裁定誤預測計數歸前端，`be_rob` 不重複計。 |
+**歸因原則（監督者裁決）：每個 stall cycle 必須恰好有一個擁有者，而且必須是真正的來源。**
+「下游收得下、但前端一條 uop 都交不出來」這個集合被切成**互斥的兩半**：
+
+| 埠 | 條件 | 意義 |
+|---|---|---|
+| `cnt_st_fetch`  | `starve & ~refill_q` | **真正的前端斷流**：I-cache 泡泡、fetch buffer 沒東西 |
+| `cnt_st_refill` | `starve &  refill_q` | **flush 後的重填拍**：真正的來源是誤預測，不是 fetch 頻寬 |
+| `cnt_mispred`   | 切 shadow 的次數 | 前端偵測到的方向誤預測（事件數，不是拍數）|
+
+其中 `starve = de_ready & (de_valid == 0) & ~flush`。
+
+- **兩者相加 == 舊版的 `cnt_st_fetch`**：一拍都沒有多算、也沒有漏掉。
+  舊版把重填拍混在 `cnt_st_fetch` 裡，上界是 `cnt_mispred x 重填深度`，
+  以 CoreMark 的誤預測次數看可能到幾萬拍，足以讓「前端斷流」的結論整個偏掉。
+- `refill_q`：`flush` 時置 1，**第一次成功送出 uop**（`de_ready & de_valid != 0`）時清 0。
+- **`rst` 不算 refill**：冷啟動填管線記在 `cnt_st_fetch`。`cnt_st_refill` 的定義是
+  「flush 之後」，reset 不是 flush。
+- **flush 當拍兩邊都不計**：那是誤預測懲罰本身，事件已記在 `cnt_mispred`。
+- 下游回壓的拍（`de_ready = 0`）兩邊都不計 —— 那時 `starve = 0`，
+  由下游自己的 counter 認領，不會重複。
+- `cnt_st_fetch` **不含**「交得出但不足 4 條」的部分斷流（那不是全停，無法獨立歸因）。
+
+驗證（T14）：flush 之後連續 4 拍沒有 uop 可送 → `cnt_st_refill` **精確 +4**、
+`cnt_st_fetch` 完全不動；送出一條 uop 離開重填視窗後再餓 3 拍 →
+`cnt_st_fetch` **精確 +3**、`cnt_st_refill` 不動。
 
 ---
 
@@ -206,11 +309,39 @@ checkpoint 或 ROB walk。這個相依關係請監督者保留在契約裡。）
 `rn_rename` 是**組合查表 + 邊緣更新狀態**：RN 階段的 pipeline register 實際上是下游
 `be_dispatch` 的輸入暫存器，這讓 4-wide bundle 旁路不必再多一層旁路網路。
 
-### 3.6 counter 語意
+### 3.6 counter 語意與 stall 歸因
 
-| 埠 | 定義 |
-|---|---|
-| `cnt_st_rename` | `(de_valid != 0) & (~rn_ready | ~enough_free) & ~flush` 的 cycle 數。**同時含 freelist 耗盡與下游 backpressure 兩種 stall**（契約指定）。要分離兩者需新增埠。 |
+**歸因原則（監督者裁決，2026-09-21）：一個 stall cycle 只能被歸因到一個來源，
+而且必須是真正的來源。** 本模組輸出兩個互斥的 counter：
+
+| 埠 | 條件 | 意義 |
+|---|---|---|
+| `cnt_st_rename` | `(de_valid != 0) & ~enough_free & ~flush` | **rename 自己的資源不夠**：freelist 耗盡，配不出實體暫存器 |
+| `cnt_st_backpressure` | `(de_valid != 0) & enough_free & ~rn_ready & ~flush` | **有能力送但下游不收**：`rn_ready = 0` |
+
+- 兩者由 `enough_free` 互斥，同一拍不會同時 +1。
+- **下游是誰造成的不由本模組認定**：`rn_ready` 被 IQ / LSQ / ROB / MSHR 任何一個拉低
+  都算 `cnt_st_backpressure`，實際兇手由下游自己的 `cnt_st_iq / lsq / rob / mshr` 指認。
+- **兩者都排除 flush 拍**：`be_dispatch` 在 flush 時會拉低 `rn_ready`，那是誤預測懲罰
+  （事件已記在 `cnt_mispred`、被丟掉的 uop 記在 `cnt_wrongpath`），不是資源不足。
+- 同一拍「freelist 也空、下游也不收」時記在 `cnt_st_rename`（自己的資源優先）。
+  此時兩個原因同時成立、單修一邊都救不了。
+  **若之後 sweep 顯示這個重疊很大，要加第三個 bucket，不要改優先序**
+  （監督者已採納此判斷）—— 改優先序只是把偏差換個方向，加 bucket 才是真的解決。
+
+#### 修正紀錄：舊版會把下游回壓算到 rename 頭上
+
+v1 的條件是 `(|de_valid) & (~rn_ready | ~enough_free) & ~flush`，
+`~rn_ready` 那一項把 IQ / LSQ / ROB / MSHR 的回壓全部記成「rename stall」，
+與下游自己的 counter **重複計數**，導致 PRF sweep 得出「rename 佔 51% stall、
+PRF 64 配 ROB 64 失衡」的錯誤結論（真正的瓶頸是 LSQ 與 IQ）。
+現已拆成上表兩個互斥 counter。
+
+驗證（T7 / T12 / T13）：
+- freelist 耗盡時只有 `cnt_st_rename` 增加，`cnt_st_backpressure` 維持 0；
+- `rn_ready = 0` 且 freelist 有餘時，`cnt_st_backpressure` **精確增加 5**（5 拍），
+  `cnt_st_rename` 完全不動；
+- flush 拍（同時 `rn_ready = 0`）兩個 counter 都不動。
 
 ---
 
@@ -223,7 +354,8 @@ checkpoint 或 ROB walk。這個相依關係請監督者保留在契約裡。）
    但這是 `fb_fe_event` per-block 語意的必然結果。
 3. **decode queue 深度固定 16**，沒有對應的 `cfg_*`（契約 §3 沒給前端 queue 的配置暫存器），
    所以這一維無法做 DSE。監督者已接受為已知限制。
-4. **`cnt_st_fetch` 只計「完全交不出 uop」**，不計「交得出但不足 4 條」。
+4. **`cnt_st_fetch` 只計「完全交不出 uop」**，不計「交得出但不足 4 條」
+   （那不是全停，無法乾淨地歸因給單一來源）。flush 後的重填拍已分離到 `cnt_st_refill`。
 5. **rename 沒有自己的 pipeline register**（§3.5），RN 的拍數由 `be_dispatch` 負責。
 6. **`cfg_fetch_width = 0` 會讓前端永遠不取**（非法配置），由 runtime 保證 ≥ 1。
 7. flush 復原的精確性依賴 `be_rob` 的 commit-time flush（§3.4）。
@@ -242,6 +374,8 @@ checkpoint 或 ROB walk。這個相依關係請監督者保留在契約裡。）
 | 5 | ready 單 bit | 定為契約（all-or-nothing），已寫進 ifc.vh。 |
 | 6 | `ARF_W`(6) vs `DUOP_D`(5) | 已知限制，不改（demo 無 FP）。 |
 | 7 | decode queue 無 `cfg_*` | 已知限制；`cfg_fetch_width ≥ 1` 由 runtime 保證。 |
+| 8 | `cnt_st_rename` 把下游回壓也算進去（重複計數，害 PRF sweep 得出相反結論）| **已解**：拆成互斥的 `cnt_st_rename`（freelist 不夠）與新增的 `cnt_st_backpressure`（下游不收），flush 拍兩者都排除。埠由監督者加進 `top.v`。 |
+| 9 | `cnt_st_fetch` 把 flush 後的重填拍算成前端斷流 | **已解**：監督者採方案 (a)，新增 `cnt_st_refill` 埠（`top.v` v6 已接）。兩者互斥且相加等於舊值。 |
 
 §3.4 的相依已由監督者確認並寫進契約：`be_rob` 是 commit-time flush（走到 wrong-path uop
 才拉 flush 並丟掉 ROB 其餘全部項目），所以 **cRAT 復原是精確的，不是近似**。

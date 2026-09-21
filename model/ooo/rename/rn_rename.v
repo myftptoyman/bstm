@@ -10,6 +10,8 @@
 //   - flush：RAT <- cRAT，freelist <- committed freelist(cfl)
 //   - freelist 用 64-bit bitmask + 4 級 priority pick（純邏輯，無算術）
 //   - 48-bit counter 用 6 段 8-bit 進位鏈（規則 1：無寬算術）
+//   - 實體暫存器的寬度/數量全部走 `PRF_W / `PRF_N，沒有硬編 6/64：
+//     PRF sweep（64/128/192/256）只要改 ifc.vh 就能重編，不必動本檔
 // ===================================================================
 module rn_rename (
     input  wire clk, input wire rst, input wire flush,
@@ -23,12 +25,17 @@ module rn_rename (
     input  wire [`W-1:0]         cmt_dv,
     input  wire [`W*`ARF_W-1:0]  cmt_arf,
     input  wire [`W*`PRF_W-1:0]  cmt_prf,      // v2: 新 mapping（非舊的）
-    output wire [47:0]           cnt_st_rename
+    output wire [47:0]           cnt_st_rename,
+    output wire [47:0]           cnt_st_backpressure
 );
 
-localparam ARF_N = 32;           // demo 只用 x0..x31
-localparam DW    = `DUOP_W;
-localparam RW    = `RUOP_W;
+localparam ARF_N  = 32;          // 架構暫存器數，demo 只用 x0..x31
+// ---- 下面三個常數「碰巧」是 5/4/6，但語意與 `PRF_W / `ROB_W 完全無關，
+//      做 PRF/ROB sweep 時不可以跟著改（也不要被 regex 一把掃掉）----
+localparam ARFI_W = 5;           // 架構暫存器索引寬度 = DUOP_D 寬度（ARF_N=32）
+localparam CNT_B  = 6;           // 48-bit counter 切成 6 段 8-bit 進位鏈
+localparam DW     = `DUOP_W;
+localparam RW     = `RUOP_W;
 
 // ---------------- 狀態 ----------------
 reg [ARF_N*`PRF_W-1:0] rat_q;    // 推測 RAT：架構暫存器 -> 實體暫存器
@@ -38,12 +45,12 @@ reg [`PRF_N-1:0]       cfl_q;    // committed freelist（flush 時的 fl 來源�
 
 // ---------------- RAT 讀（mux 鏈，非記憶體）----------------
 function [`PRF_W-1:0] rat_rd;
-    input [4:0] a;
+    input [ARFI_W-1:0] a;
     integer k;
     begin
         rat_rd = rat_q[0 +: `PRF_W];
         for (k = 1; k < ARF_N; k = k + 1)
-            if (a == k[4:0]) rat_rd = rat_q[`PRF_W*k +: `PRF_W];
+            if (a == k[ARFI_W-1:0]) rat_rd = rat_q[`PRF_W*k +: `PRF_W];
     end
 endfunction
 
@@ -56,7 +63,7 @@ function [`PRF_W-1:0] crat_rd;
     begin
         crat_rd = {`PRF_W{1'b0}};
         for (k = 1; k < ARF_N; k = k + 1)
-            if (a == {1'b0, k[4:0]}) crat_rd = crat_q[`PRF_W*k +: `PRF_W];
+            if (a == {{(`ARF_W-ARFI_W){1'b0}}, k[ARFI_W-1:0]}) crat_rd = crat_q[`PRF_W*k +: `PRF_W];
     end
 endfunction
 
@@ -91,10 +98,10 @@ wire [DW-1:0] d3 = de_duop[3*DW +: DW];
 wire unused_blkend = |{d0[`DUOP_BLKEND], d1[`DUOP_BLKEND],
                        d2[`DUOP_BLKEND], d3[`DUOP_BLKEND]};
 
-wire [4:0] ad0 = d0[`DUOP_D];    // 目的架構暫存器（5 bit）
-wire [4:0] ad1 = d1[`DUOP_D];
-wire [4:0] ad2 = d2[`DUOP_D];
-wire [4:0] ad3 = d3[`DUOP_D];
+wire [ARFI_W-1:0] ad0 = d0[`DUOP_D];    // 目的架構暫存器（5 bit）
+wire [ARFI_W-1:0] ad1 = d1[`DUOP_D];
+wire [ARFI_W-1:0] ad2 = d2[`DUOP_D];
+wire [ARFI_W-1:0] ad3 = d3[`DUOP_D];
 
 // x0 不配實體暫存器
 wire dv0 = d0[`DUOP_DV] & (ad0 != 5'd0);
@@ -158,54 +165,82 @@ wire s2v1 = d1[`DUOP_S2V] & (a2_1 != {`ARF_W{1'b0}});
 wire s2v2 = d2[`DUOP_S2V] & (a2_2 != {`ARF_W{1'b0}});
 wire s2v3 = d3[`DUOP_S2V] & (a2_3 != {`ARF_W{1'b0}});
 
-wire hit0_1 = nd0 & (a1_1 == {1'b0, ad0});   // uop1 的 src1 相依於 uop0
-wire hit0_2 = nd0 & (a1_2 == {1'b0, ad0});
-wire hit1_2 = nd1 & (a1_2 == {1'b0, ad1});
-wire hit0_3 = nd0 & (a1_3 == {1'b0, ad0});
-wire hit1_3 = nd1 & (a1_3 == {1'b0, ad1});
-wire hit2_3 = nd2 & (a1_3 == {1'b0, ad2});
+wire hit0_1 = nd0 & (a1_1 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});   // uop1 的 src1 相依於 uop0
+wire hit0_2 = nd0 & (a1_2 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});
+wire hit1_2 = nd1 & (a1_2 == {{(`ARF_W-ARFI_W){1'b0}}, ad1});
+wire hit0_3 = nd0 & (a1_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});
+wire hit1_3 = nd1 & (a1_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad1});
+wire hit2_3 = nd2 & (a1_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad2});
 
-wire g0_1 = nd0 & (a2_1 == {1'b0, ad0});     // src2 同理
-wire g0_2 = nd0 & (a2_2 == {1'b0, ad0});
-wire g1_2 = nd1 & (a2_2 == {1'b0, ad1});
-wire g0_3 = nd0 & (a2_3 == {1'b0, ad0});
-wire g1_3 = nd1 & (a2_3 == {1'b0, ad1});
-wire g2_3 = nd2 & (a2_3 == {1'b0, ad2});
+wire g0_1 = nd0 & (a2_1 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});     // src2 同理
+wire g0_2 = nd0 & (a2_2 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});
+wire g1_2 = nd1 & (a2_2 == {{(`ARF_W-ARFI_W){1'b0}}, ad1});
+wire g0_3 = nd0 & (a2_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad0});
+wire g1_3 = nd1 & (a2_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad1});
+wire g2_3 = nd2 & (a2_3 == {{(`ARF_W-ARFI_W){1'b0}}, ad2});
 
 // 後面的 uop 看到前面最新的 mapping（由後往前優先）
-wire [`PRF_W-1:0] ps1_0 = rat_rd(a1_0[4:0]);
-wire [`PRF_W-1:0] ps1_1 = hit0_1 ? p0 : rat_rd(a1_1[4:0]);
-wire [`PRF_W-1:0] ps1_2 = hit1_2 ? p1 : hit0_2 ? p0 : rat_rd(a1_2[4:0]);
-wire [`PRF_W-1:0] ps1_3 = hit2_3 ? p2 : hit1_3 ? p1 : hit0_3 ? p0 : rat_rd(a1_3[4:0]);
+wire [`PRF_W-1:0] ps1_0 = rat_rd(a1_0[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps1_1 = hit0_1 ? p0 : rat_rd(a1_1[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps1_2 = hit1_2 ? p1 : hit0_2 ? p0 : rat_rd(a1_2[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps1_3 = hit2_3 ? p2 : hit1_3 ? p1 : hit0_3 ? p0 : rat_rd(a1_3[ARFI_W-1:0]);
 
-wire [`PRF_W-1:0] ps2_0 = rat_rd(a2_0[4:0]);
-wire [`PRF_W-1:0] ps2_1 = g0_1 ? p0 : rat_rd(a2_1[4:0]);
-wire [`PRF_W-1:0] ps2_2 = g1_2 ? p1 : g0_2 ? p0 : rat_rd(a2_2[4:0]);
-wire [`PRF_W-1:0] ps2_3 = g2_3 ? p2 : g1_3 ? p1 : g0_3 ? p0 : rat_rd(a2_3[4:0]);
+wire [`PRF_W-1:0] ps2_0 = rat_rd(a2_0[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps2_1 = g0_1 ? p0 : rat_rd(a2_1[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps2_2 = g1_2 ? p1 : g0_2 ? p0 : rat_rd(a2_2[ARFI_W-1:0]);
+wire [`PRF_W-1:0] ps2_3 = g2_3 ? p2 : g1_3 ? p1 : g0_3 ? p0 : rat_rd(a2_3[ARFI_W-1:0]);
 
-// ---------------- 輸出 ruop（介面 v3：40 bit）----------------
-// bit[31:0] 佈局不變；bit[37:32] 新增架構目的暫存器，供 be_rob 產生 cmt_arf。
-// RUOP_ARFD/ARFDV 是 DUOP_D/DUOP_DV 的原樣複製（未經 x0 gating），
-// 實體暫存器仍走 RUOP_D/RUOP_DV（dst=x0 時為 0，因為 x0 不配實體暫存器）。
-// dst=x0 的 uop 會出現 ARFDV=1 但 RUOP_DV=0；此時 cmt_arf=0，
-// rn_rename 的 commit 守衛 (cmt_arf != 0) 會把它丟掉，不會污染 cRAT。
+// ---------------- 輸出 ruop ----------------
+// 逐欄位填，不用位元連接：RUOP 的欄位寬度與整體寬度會隨 `PRF_W 改變
+// （PRF sweep 時由產生器重排佈局，且可能有保留位元），走巨集逐欄位填才不會錯位。
+// RUOP_ARFD/ARFDV 是 DUOP_D/DUOP_DV 的原樣複製（未經 x0 gating），供 be_rob 產生
+// cmt_arf；實體暫存器仍走 RUOP_D/RUOP_DV。dst=x0 的 uop 會是 ARFDV=1 但 RUOP_DV=0，
+// 此時 cmt_arf=0，commit 守衛 (cmt_arf != 0) 會擋掉，不會污染 cRAT。
 // rn_valid 只由 freelist 決定，不看 rn_ready -> 不會產生 valid/ready 組合迴圈
-assign rn_ruop[0*RW +: RW] = {2'b00, d0[`DUOP_DV], d0[`DUOP_D],
-                              d0[`DUOP_WRONGPATH], d0[`DUOP_CLASS], d0[`DUOP_LAT],
-                              s1v0, ps1_0, s2v0, ps2_0, dv0, p0,
-                              d0[`DUOP_MEMSTORE], d0[`DUOP_SERIALIZE]};
-assign rn_ruop[1*RW +: RW] = {2'b00, d1[`DUOP_DV], d1[`DUOP_D],
-                              d1[`DUOP_WRONGPATH], d1[`DUOP_CLASS], d1[`DUOP_LAT],
-                              s1v1, ps1_1, s2v1, ps2_1, dv1, p1,
-                              d1[`DUOP_MEMSTORE], d1[`DUOP_SERIALIZE]};
-assign rn_ruop[2*RW +: RW] = {2'b00, d2[`DUOP_DV], d2[`DUOP_D],
-                              d2[`DUOP_WRONGPATH], d2[`DUOP_CLASS], d2[`DUOP_LAT],
-                              s1v2, ps1_2, s2v2, ps2_2, dv2, p2,
-                              d2[`DUOP_MEMSTORE], d2[`DUOP_SERIALIZE]};
-assign rn_ruop[3*RW +: RW] = {2'b00, d3[`DUOP_DV], d3[`DUOP_D],
-                              d3[`DUOP_WRONGPATH], d3[`DUOP_CLASS], d3[`DUOP_LAT],
-                              s1v3, ps1_3, s2v3, ps2_3, dv3, p3,
-                              d3[`DUOP_MEMSTORE], d3[`DUOP_SERIALIZE]};
+// 每條 uop 的欄位打包成向量，generate 迴圈才能用 genvar 取（全部是常數索引）
+wire [`W*`PRF_W-1:0] ps1_v = {ps1_3, ps1_2, ps1_1, ps1_0};
+wire [`W*`PRF_W-1:0] ps2_v = {ps2_3, ps2_2, ps2_1, ps2_0};
+wire [`W*`PRF_W-1:0] pd_v  = {p3,    p2,    p1,    p0};
+wire [`W-1:0]        s1v_v = {s1v3,  s1v2,  s1v1,  s1v0};
+wire [`W-1:0]        s2v_v = {s2v3,  s2v2,  s2v1,  s2v0};
+wire [`W-1:0]        dv_v  = {dv3,   dv2,   dv1,   dv0};
+wire [`W-1:0]        wp_v  = {d3[`DUOP_WRONGPATH], d2[`DUOP_WRONGPATH],
+                              d1[`DUOP_WRONGPATH], d0[`DUOP_WRONGPATH]};
+wire [`W*`UC_W-1:0] cls_v = {d3[`DUOP_CLASS], d2[`DUOP_CLASS],
+                              d1[`DUOP_CLASS], d0[`DUOP_CLASS]};
+wire [`W*`LAT_W-1:0] lat_v = {d3[`DUOP_LAT], d2[`DUOP_LAT],
+                              d1[`DUOP_LAT], d0[`DUOP_LAT]};
+wire [`W-1:0]        ms_v  = {d3[`DUOP_MEMSTORE], d2[`DUOP_MEMSTORE],
+                              d1[`DUOP_MEMSTORE], d0[`DUOP_MEMSTORE]};
+wire [`W-1:0]        sz_v  = {d3[`DUOP_SERIALIZE], d2[`DUOP_SERIALIZE],
+                              d1[`DUOP_SERIALIZE], d0[`DUOP_SERIALIZE]};
+// 架構目的暫存器：DUOP_D / DUOP_DV 的原樣複製（未經 x0 gating）
+wire [`W*ARFI_W-1:0] ad_v  = {ad3, ad2, ad1, ad0};
+wire [`W-1:0]        adv_v = {d3[`DUOP_DV], d2[`DUOP_DV], d1[`DUOP_DV], d0[`DUOP_DV]};
+
+genvar gj;
+generate
+for (gj = 0; gj < `W; gj = gj + 1) begin : g_ruop
+    reg [RW-1:0] ru;
+    always @* begin
+        ru = {RW{1'b0}};                       // 保留位元一律填 0
+        ru[`RUOP_WRONGPATH] = wp_v[gj];
+        ru[`RUOP_CLASS]     = cls_v[gj*`UC_W +: `UC_W];
+        ru[`RUOP_LAT]       = lat_v[gj*`LAT_W +: `LAT_W];
+        ru[`RUOP_S1V]       = s1v_v[gj];
+        ru[`RUOP_S1]        = ps1_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_S2V]       = s2v_v[gj];
+        ru[`RUOP_S2]        = ps2_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_DV]        = dv_v[gj];
+        ru[`RUOP_D]         = pd_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_MEMSTORE]  = ms_v[gj];
+        ru[`RUOP_SERIALIZE] = sz_v[gj];
+        ru[`RUOP_ARFD]      = ad_v[gj*ARFI_W +: ARFI_W];
+        ru[`RUOP_ARFDV]     = adv_v[gj];
+    end
+    assign rn_ruop[gj*RW +: RW] = ru;
+end
+endgenerate
 
 assign rn_valid = de_valid & {`W{enough_free}};
 assign de_ready = rn_ready & enough_free;
@@ -265,19 +300,20 @@ wire [ARF_N*`PRF_W-1:0] crat_nxt;
 genvar gk;
 generate
 for (gk = 0; gk < ARF_N; gk = gk + 1) begin : g_crat
-    localparam [4:0] KI = gk[4:0];
+    localparam [ARFI_W-1:0] KI = gk[ARFI_W-1:0];
     assign crat_nxt[`PRF_W*gk +: `PRF_W] =
         (gk == 0)                     ? {`PRF_W{1'b0}} :
-        (cv3 & (ca3 == {1'b0, KI}))   ? cp3 :
-        (cv2 & (ca2 == {1'b0, KI}))   ? cp2 :
-        (cv1 & (ca1 == {1'b0, KI}))   ? cp1 :
-        (cv0 & (ca0 == {1'b0, KI}))   ? cp0 :
+        (cv3 & (ca3 == {{(`ARF_W-ARFI_W){1'b0}}, KI}))   ? cp3 :
+        (cv2 & (ca2 == {{(`ARF_W-ARFI_W){1'b0}}, KI}))   ? cp2 :
+        (cv1 & (ca1 == {{(`ARF_W-ARFI_W){1'b0}}, KI}))   ? cp1 :
+        (cv0 & (ca0 == {{(`ARF_W-ARFI_W){1'b0}}, KI}))   ? cp0 :
                                         crat_q[`PRF_W*gk +: `PRF_W];
 end
 endgenerate
 
-// reset 狀態：arch i -> phys i，freelist = phys 32..63
-wire [`PRF_N-1:0] fl_init = {{(`PRF_N/2){1'b1}}, {(`PRF_N/2){1'b0}}};
+// reset 狀態：arch i -> phys i（i = 0..ARF_N-1），其餘全部進 freelist。
+// 不能寫成 PRF_N/2 —— PRF sweep 到 128/256 時那會平白少掉一半可配的實體暫存器。
+wire [`PRF_N-1:0] fl_init = {{(`PRF_N-ARF_N){1'b1}}, {ARF_N{1'b0}}};
 
 // ---------------- 時序：RAT / freelist ----------------
 integer k;
@@ -300,10 +336,10 @@ always @(posedge clk) begin
         end else begin
             // 每個架構暫存器一組展開的比較器；後面的 uop 優先 -> bundle 內 WAW 正確
             for (k = 1; k < ARF_N; k = k + 1) begin
-                if      (w3 & (ad3 == k[4:0])) rat_q[`PRF_W*k +: `PRF_W] <= p3;
-                else if (w2 & (ad2 == k[4:0])) rat_q[`PRF_W*k +: `PRF_W] <= p2;
-                else if (w1 & (ad1 == k[4:0])) rat_q[`PRF_W*k +: `PRF_W] <= p1;
-                else if (w0 & (ad0 == k[4:0])) rat_q[`PRF_W*k +: `PRF_W] <= p0;
+                if      (w3 & (ad3 == k[ARFI_W-1:0])) rat_q[`PRF_W*k +: `PRF_W] <= p3;
+                else if (w2 & (ad2 == k[ARFI_W-1:0])) rat_q[`PRF_W*k +: `PRF_W] <= p2;
+                else if (w1 & (ad1 == k[ARFI_W-1:0])) rat_q[`PRF_W*k +: `PRF_W] <= p1;
+                else if (w0 & (ad0 == k[ARFI_W-1:0])) rat_q[`PRF_W*k +: `PRF_W] <= p0;
             end
             fl_q <= (fl_q & ~alloc_mask) | free_mask;
         end
@@ -311,17 +347,27 @@ always @(posedge clk) begin
 end
 
 // ---------------- counter（6 段 8-bit 進位鏈）----------------
-// cnt_st_rename：有 uop 要 rename 但因 freelist 空或下游 backpressure 而停
-wire c_rn_inc = (|de_valid) & (~rn_ready | ~enough_free) & ~flush;
+// 歸因原則：一個 stall cycle 只能記在「真正的來源」身上，不可重複計。
+//   cnt_st_rename       = 前端有東西要送，但 rename 自己的資源不夠（freelist 耗盡）
+//   cnt_st_backpressure = rename 有能力送，但下游 (rn_ready=0) 不收
+// 兩者由 enough_free 互斥（不會同時 +1）；下游是誰造成的由下游自己的
+// cnt_st_iq / lsq / rob / mshr 負責，本模組不碰。
+// 兩者都排除 flush 拍：be_dispatch 在 flush 時會拉低 rn_ready，那是誤預測
+// 懲罰（已計在 cnt_mispred / cnt_wrongpath），不是下游資源不足。
+// 註：若同一拍「freelist 也空、下游也不收」，依上面的順序記在 cnt_st_rename
+// （自己的資源優先）。此時兩個原因同時成立，單修一邊都救不了。
+wire c_rn_inc = (|de_valid) & ~enough_free & ~flush;
+wire c_bp_inc = (|de_valid) &  enough_free & ~rn_ready & ~flush;
 reg  [47:0] c_rn_q;
-wire [4:0]  c_rn_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [5:0]  c_rn_car;
+wire [CNT_B-2:0] c_rn_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
+wire [CNT_B-1:0] c_rn_car;
 genvar gr;
 generate
-for (gr = 0; gr < 5; gr = gr + 1) begin : g_rn
+for (gr = 0; gr < CNT_B-1; gr = gr + 1) begin : g_rn
     assign c_rn_ff[gr] = (c_rn_q[8*gr +: 8] == 8'hFF);
 end
 endgenerate
+// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
 assign c_rn_car[0] = c_rn_inc;
 assign c_rn_car[1] = c_rn_inc & c_rn_ff[0];
 assign c_rn_car[2] = c_rn_inc & (&c_rn_ff[1:0]);
@@ -329,15 +375,37 @@ assign c_rn_car[3] = c_rn_inc & (&c_rn_ff[2:0]);
 assign c_rn_car[4] = c_rn_inc & (&c_rn_ff[3:0]);
 assign c_rn_car[5] = c_rn_inc & (&c_rn_ff[4:0]);
 
+reg  [47:0] c_bp_q;
+wire [CNT_B-2:0] c_bp_ff;
+wire [CNT_B-1:0] c_bp_car;
+genvar gb;
+generate
+for (gb = 0; gb < CNT_B-1; gb = gb + 1) begin : g_bp
+    assign c_bp_ff[gb] = (c_bp_q[8*gb +: 8] == 8'hFF);
+end
+endgenerate
+// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
+assign c_bp_car[0] = c_bp_inc;
+assign c_bp_car[1] = c_bp_inc & c_bp_ff[0];
+assign c_bp_car[2] = c_bp_inc & (&c_bp_ff[1:0]);
+assign c_bp_car[3] = c_bp_inc & (&c_bp_ff[2:0]);
+assign c_bp_car[4] = c_bp_inc & (&c_bp_ff[3:0]);
+assign c_bp_car[5] = c_bp_inc & (&c_bp_ff[4:0]);
+
 integer ic;
 always @(posedge clk) begin
-    if (rst) c_rn_q <= 48'd0;
-    else begin
-        for (ic = 0; ic < 6; ic = ic + 1)
+    if (rst) begin
+        c_rn_q <= 48'd0;
+        c_bp_q <= 48'd0;
+    end else begin
+        for (ic = 0; ic < CNT_B; ic = ic + 1) begin
             if (c_rn_car[ic]) c_rn_q[8*ic +: 8] <= c_rn_q[8*ic +: 8] + 8'd1;
+            if (c_bp_car[ic]) c_bp_q[8*ic +: 8] <= c_bp_q[8*ic +: 8] + 8'd1;
+        end
     end
 end
 
-assign cnt_st_rename = c_rn_q;
+assign cnt_st_rename       = c_rn_q;
+assign cnt_st_backpressure = c_bp_q;
 
 endmodule

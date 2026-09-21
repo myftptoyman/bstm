@@ -31,11 +31,13 @@ module ooo_top (
     output wire [47:0]              cnt_retired,
     output wire [47:0]              cnt_wrongpath,
     output wire [47:0]              cnt_st_fetch,    // 前端斷流
-    output wire [47:0]              cnt_st_rename,   // freelist/RAT 滿
+    output wire [47:0]              cnt_st_rename,   // v6: 只計 rename 自己的資源（freelist）
     output wire [47:0]              cnt_st_iq,       // IQ 滿
     output wire [47:0]              cnt_st_rob,      // ROB 滿
     output wire [47:0]              cnt_st_lsq,      // LDQ/STQ 滿
     output wire [47:0]              cnt_st_mshr,     // MSHR 滿
+    output wire [47:0]              cnt_st_backpressure, // v6: 有能力但下游不收
+    output wire [47:0]              cnt_st_refill,       // v6: flush 後 decode queue 重填
     output wire [47:0]              cnt_mispred,
     output wire [47:0]              cnt_rob_occ_sum  // 除以 cycles = 平均佔用
 );
@@ -77,7 +79,7 @@ module ooo_top (
         .fb_take(fb_take), .fb_redirect(fb_redirect), .fb_redir_shadow(fb_redir_shadow),
         .mispred_in(flush),
         .de_valid(de_valid), .de_duop(de_duop), .de_ready(de_ready),
-        .cnt_st_fetch(cnt_st_fetch), .cnt_mispred(cnt_mispred)
+        .cnt_st_fetch(cnt_st_fetch), .cnt_st_refill(cnt_st_refill), .cnt_mispred(cnt_mispred)
     );
 
     rn_rename u_rn (
@@ -85,7 +87,7 @@ module ooo_top (
         .de_valid(de_valid), .de_duop(de_duop), .de_ready(de_ready),
         .rn_valid(rn_valid), .rn_ruop(rn_ruop), .rn_ready(rn_ready),
         .cmt_valid(cmt_valid), .cmt_dv(cmt_dv), .cmt_arf(cmt_arf), .cmt_prf(cmt_prf),
-        .cnt_st_rename(cnt_st_rename)
+        .cnt_st_rename(cnt_st_rename), .cnt_st_backpressure(cnt_st_backpressure)
     );
 
     // ================= Agent E =================

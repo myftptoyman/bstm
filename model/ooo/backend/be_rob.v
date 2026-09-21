@@ -49,7 +49,10 @@ module be_rob (
     reg [`ROB_N-1:0] rob_done;
     reg [`ROB_N-1:0] rob_wp;
     reg [`ROB_N-1:0] rob_dv;
-    reg [`ROB_N*5-1:0] rob_a;                 // RUOP_ARFD：架構目的暫存器 x0..x31
+    // ARFD_W 是 `RUOP_ARFD 的欄位寬度（ifc.vh 為 5 bit：x0..x31）。
+    // Verilog-2005 沒辦法從 range 巨集取寬度，所以這裡明寫；ifc 若加寬 ARFD 要同步改這一行。
+    localparam ARFD_W = 5;
+    reg [`ROB_N*ARFD_W-1:0] rob_a;            // RUOP_ARFD：架構目的暫存器 x0..x31
     reg [`ROB_N*`PRF_W-1:0] rob_d;            // RUOP_D：寫入的實體暫存器（packed，避免記憶體推斷）
     reg [`ROB_W-1:0] rob_head;
     reg [6:0]        rob_cnt;                 // 0..64
@@ -63,9 +66,17 @@ module be_rob (
     reg [6:0]            h_p1;
     reg [2:0]            n_cmt;
     reg                  stop, do_flush;
-    reg [14:0]           ent;
+    reg [3+ARFD_W+`PRF_W:0] ent;
     reg [`W*`ARF_W-1:0]  c_arf;
     integer              cj, wi, wk;
+
+    // 每 lane 的 RUOP 切成獨立 wire，欄位一律走 ifc.vh 巨集
+    // （不要用 `ds_ruop[k*`RUOP_W + 2 +: `PRF_W]` 這種硬編偏移：RUOP 一重新佈局就靜默壞掉）
+    wire [`RUOP_W-1:0] duop [0:`W-1];
+    genvar g;
+    generate for (g = 0; g < `W; g = g + 1) begin : ds_lane
+        assign duop[g] = ds_ruop[g*`RUOP_W +: `RUOP_W];
+    end endgenerate
 
     // 所有 ROB 欄位都是 packed vector（不用 unpacked 陣列，確保不會推斷出
     // 非同步讀的 $mem / RAMGEM），而且只用常數索引展開成 mux 鏈，
@@ -73,12 +84,12 @@ module be_rob (
     // 回傳 {v, done, wp, dv, arf[4:0], d[5:0]}
     // 註：RUOP_ARFDV 在本模組用不到 —— cmt_dv 一律看 RUOP_DV，
     //     dst=x0 的 uop 是 ARFDV=1 / DV=0，rename 端再以 cmt_arf!=0 過濾。
-    function [14:0] rd_ent; input [`ROB_W-1:0] ix; integer q; begin
-        rd_ent = 15'd0;
+    function [3+ARFD_W+`PRF_W:0] rd_ent; input [`ROB_W-1:0] ix; integer q; begin
+        rd_ent = {(4+ARFD_W+`PRF_W){1'b0}};
         for (q = 0; q < `ROB_N; q = q + 1)
             if (q[`ROB_W-1:0] == ix)
                 rd_ent = {rob_v[q], rob_done[q], rob_wp[q], rob_dv[q],
-                          rob_a[q*5 +: 5], rob_d[q*`PRF_W +: `PRF_W]};
+                          rob_a[q*ARFD_W +: ARFD_W], rob_d[q*`PRF_W +: `PRF_W]};
     end endfunction
 
     // ---------------------------------------------- commit / flush 掃描
@@ -94,21 +105,21 @@ module be_rob (
         c_arf    = {(`W*`ARF_W){1'b0}};
         c_idx    = {(`W*`ROB_W){1'b0}};
         h_p1     = 7'd0;
-        ent = 15'd0;
+        ent = {(4+ARFD_W+`PRF_W){1'b0}};
         for (cj = 0; cj < `W; cj = cj + 1) begin
             ent = rd_ent(h_idx);
-            if (!stop && (cj[2:0] < cfg_commit_width) && ent[14] && ent[13]) begin
-                if (ent[12]) begin
+            if (!stop && (cj[2:0] < cfg_commit_width) && ent[3+ARFD_W+`PRF_W] && ent[2+ARFD_W+`PRF_W]) begin
+                if (ent[1+ARFD_W+`PRF_W]) begin
                     // 走到 wrong-path uop：不 retire，直接清管線
                     do_flush = 1'b1;
                     fl_idx   = h_idx;
                     stop     = 1'b1;
                 end else begin
                     c_v[cj]   = 1'b1;
-                    c_dvm[cj] = ent[11];             // 只看 RUOP_DV：有沒有配實體暫存器
+                    c_dvm[cj] = ent[ARFD_W+`PRF_W];             // 只看 RUOP_DV：有沒有配實體暫存器
                                                      // （dst=x0 時 ARFDV=1 但 DV=0，見 README）
                     c_prf[cj*`PRF_W +: `PRF_W] = ent[`PRF_W-1:0];
-                    c_arf[cj*`ARF_W +: `ARF_W] = {1'b0, ent[10:6]};
+                    c_arf[cj*`ARF_W +: `ARF_W] = {{(`ARF_W-ARFD_W){1'b0}}, ent[`PRF_W +: ARFD_W]};
                     c_idx[cj*`ROB_W +: `ROB_W] = h_idx;
                     n_cmt     = n_cmt + 3'd1;
                     h_p1      = {1'b0, h_idx} + 7'd1;
@@ -182,10 +193,10 @@ module be_rob (
                         if (ds_valid[wk] && (ds_robidx[wk*`ROB_W +: `ROB_W] == wi[`ROB_W-1:0])) begin
                             rob_v[wi]    <= 1'b1;
                             rob_done[wi] <= 1'b0;
-                            rob_wp[wi]   <= ds_ruop[wk*`RUOP_W + `RUOP_WRONGPATH];
-                            rob_dv[wi]   <= ds_ruop[wk*`RUOP_W + `RUOP_DV];
-                            rob_d[wi*`PRF_W +: `PRF_W] <= ds_ruop[wk*`RUOP_W + 2 +: `PRF_W];
-                            rob_a[wi*5 +: 5]           <= ds_ruop[wk*`RUOP_W + 32 +: 5];
+                            rob_wp[wi]   <= duop[wk][`RUOP_WRONGPATH];
+                            rob_dv[wi]   <= duop[wk][`RUOP_DV];
+                            rob_d[wi*`PRF_W +: `PRF_W] <= duop[wk][`RUOP_D];
+                            rob_a[wi*ARFD_W +: ARFD_W]           <= duop[wk][`RUOP_ARFD];
                         end
                 end
             end

@@ -194,7 +194,7 @@ yosys 只有 4 則 "Replacing memory \e_xxx with list of registers"（`be_iq`）
 那是 ROB entry 的讀出 bundle `{v,done,wp,dv,arf[4:0],d[5:0]}`（一次 64:1 mux 讀完整筆），
 不是寬算術欄位。
 
-### 自測（verilator `--binary`，testbench 放在 /tmp，不屬於交付物）
+### 自測（verilator `--binary`，testbench 放在 `/tmp/agente_prf/tb/`，不屬於交付物）
 
 把四個模組照 `top.v` 接起來，配假 rename（總是給滿 4 條）與假 LSU（3 拍回 done），
 `cfg_*` 全開，跑 500 拍：
@@ -236,3 +236,112 @@ yosys 只有 4 則 "Replacing memory \e_xxx with list of registers"（`be_iq`）
    會由 IQ 的 `wait_m` 重新擋住，語意仍然正確。
 7. ~~`be_eu` 的 `$shift`/`$shiftx`~~ —— v3 已全部改成常數索引展開，四個模組皆為 0。
 8. `be_rob` 的 `rob_full` 用本拍開始時的佔用判斷，ROB 剛好卡在滿的邊緣時會多 stall 1 拍。
+
+## 7. PRF sweep（`PRF_W` = 6 / 7 / 8 → `PRF_N` = 64 / 128 / 256）
+
+### 7.1 參數化修正（這次補的）
+
+| 位置 | 原本 | 問題 | 改法 |
+|---|---|---|---|
+| `be_rob` `rd_ent` bundle | 硬編 `ent[14]/[13]/[12]/[11]/[10:6]`、`15'd0` | `PRF_W` 一變欄位就錯位（而且是**靜默**錯位） | 全部改成 `` ent[3+ARFD_W+`PRF_W] `` 這種相對式 |
+| `be_rob` 取 `RUOP_D` | ``ds_ruop[k*`RUOP_W + 2 +: `PRF_W]`` | 硬編偏移 2，RUOP 一重新佈局就靜默壞掉 | per-lane wire + ``duop[k][`RUOP_D]`` |
+| `be_rob` 取 `RUOP_ARFD` | ``ds_ruop[k*`RUOP_W + 32 +: 5]`` | 同上（硬編 32） | ``duop[k][`RUOP_ARFD]`` |
+| `be_rob` ARFD 欄位寬 | 散落的 `5` | Verilog-2005 無法從 range 巨集取寬度 | `localparam ARFD_W = 5`（ifc 若加寬要同步改） |
+
+`be_dispatch` / `be_iq` / `be_eu` 本來就全走巨集，這次沒有改動（`be_eu` 的 `ohrob()` 是監督者先補的）。
+
+### 7.2 驗證（三件事都做了）
+
+1. **lint**：三種 `PRF_W` 下 `verilator --lint-only -Wall -I. backend/*.v` 都 **exit 0、0 warning**。
+2. **`ci/check_contract.sh`**：三種都 **PASS=20 FAIL=0**（yosys 合成、0 problems、無 latch、無非同步記憶體）。
+3. **功能對拍（比 lint 更能抓截位）**：同一份 TB 在 `PRF_W`=6/7/8 下，8 個測試模式的
+   `IPC / retired / st_iq / st_rob / occ_avg / wrongpath / arf_bad` **逐項完全相同**。
+   TB 的 `mk()` 也改成走巨集，所以 RUOP 佈局換了不用改 TB。
+   欄位若被截掉，mode1/2（相依鏈）的 IPC 會立刻走樣 —— 沒有。
+
+### 7.3 狀態位元：解析推導 vs 實測
+
+`PRF_N` = N、`PRF_W` = P、`RUOP_W` = R。
+
+| 模組 | 狀態位元公式 | 隨 PRF 成長的部分 |
+|---|---|---|
+| `be_dispatch` | `6 + 2*48 = 102` | **無**（與 PRF 無關） |
+| `be_iq` | `1296 + 32*R + 33*N` | `e_pend` 32N（wakeup matrix）+ `wait_m` N |
+| `be_eu` | `745 + 68*P + N` | `wh_prf` 64P + `r_wb_prf` 4P + `prf_rdy` N |
+| `be_rob` | `781 + 64*P` | `rob_d` 64P（每個 ROB entry 一個 phys dst） |
+
+`be_iq` 展開：`e_v`32 + `e_uop`32R + `e_rob`192 + **`e_pend`32N** + `e_age`1024 + `wait_m`N + counter48。
+
+> **重點更正**：wakeup matrix 是 **`IQ_N × PRF_N`，每個 entry 只有一條遮罩**，不是兩條。
+> 因為就緒條件是「所有來源都好了」，src1/src2 可以合併成一條「尚未就緒來源」遮罩
+> （`ready = (pend & ~eff_ready) == 0`），不需要分開存。
+> 所以 PRF 64 是 **2,048 bit**（不是 4,096），PRF 256 是 **8,192 bit**（不是 16,384）。
+> `be_iq` 的**總**狀態（4,688 bit @PRF64）裡，wakeup matrix 只佔 44%，
+> 另外 `e_age`(1,024) 與 `e_uop`(1,280) 各佔一大塊。
+
+實測（`synth -flatten` + `abc -g AND,OR,XOR,NAND,NOR,XNOR`，格式 `gates / state_bits`）：
+
+| 模組 | PRF 64 (`PRF_W`=6) | PRF 128 (=7) | PRF 256 (=8) |
+|---|---|---|---|
+| `be_dispatch` | 451 / 102 | 451 / 102 | 451 / 102 |
+| `be_iq` | 81,854 / 4,688 | 117,375 / 7,056 | 176,679 / 11,280 |
+| `be_eu` | 13,944 / 1,217 | 15,317 / 1,349 | 18,084 / 1,545 |
+| `be_rob` | 20,469 / 1,165 | 21,217 / 1,229 | 22,875 / 1,293 |
+| **後段合計** | **116,718 / 7,172** | **154,360 / 9,736** | **218,089 / 14,220** |
+
+**12 個實測值與上面的公式逐一完全吻合**（例如 `be_iq` @PRF256 = 1296 + 32×48 + 33×256 = 11,280）。
+這就是「寬度真的打通、沒有被靜默截斷」的證據 —— 只看 lint 過不過是看不出來的。
+
+逐位元對照（Agent F 的做法）：
+* `be_rob` 每多 1 bit `PRF_W` → **+64 bit**（64 個 ROB entry 各存一個 phys dst）：1165→1229→1293 ✓
+* `be_eu`  每多 1 bit `PRF_W` → **+68 bit**（64 槽完成輪 + 4 條 wb），另加 `prf_rdy` 隨 `PRF_N` ✓
+* `be_iq`  每多 1 個 `PRF_N` entry → **+33 bit**（32 條 IQ entry 的 pend 欄 + `wait_m`）
+  64→128 = 64×33 + RUOP 加寬 32×8 = 2,368 ✓
+* `be_dispatch` 完全不變（451 gates / 102 bit ×3）✓
+
+對照組：我用同一套量法量 `lsu_q` 得到 **1,556 / 1,612 / 1,668**，與 Agent F 回報的數字**逐項相同**
+—— 兩邊獨立量到同一個答案，量法本身也被交叉驗證過了。
+
+後段狀態成長：7,172 → 9,736（+2,564，**+36%**）→ 14,220（再 +46%，對 PRF 64 是 **+98%**）。
+gate 數 116,718 → 154,360（+32%）→ 218,089（+87%）。
+
+> **模型總狀態的推估**：以監督者的 9,869 bit 為基準（我的後段數字與它一致），
+> PRF 128 約 **12.5K bit**（工作集 ~132 KB）、PRF 256 約 **17K bit**（~180 KB）。
+> 是 **+73%，不是 3 倍**；300 KB 的估計偏高，因為它假設 wakeup matrix 有兩條遮罩。
+> （rename 的 freelist/RAT 也會隨 PRF 長，那部分要問 Agent D。）
+
+### 7.4 掃到 PRF 256 值不值得：結構上的上限是 96
+
+不用等 IPC 數字就能先砍掉一半的掃描空間。PRF 的用量有硬上限：
+
+```
+活著的 phys reg = 已 commit 的架構映射 (32，RUOP_ARFD 是 5 bit)
+                + 尚未 commit 且有 dst 的 uop 數 (<= ROB_N = 64)
+                <= 96
+```
+
+每條有 dst 的 uop 在 rename 配一個 phys、在 commit 釋放舊的，
+所以「未 commit 且有 dst 的 uop」不可能超過 ROB entry 數。
+`ROB_W` = 6 把 ROB 鎖死在 64，於是：
+
+* **PRF 96 以上，freelist 在結構上就不可能耗盡** —— rename stall 會直接歸零
+* **PRF 128 已經有 33% 餘裕；PRF 256 在 ROB=64 下是完全用不到的死重**
+  （多出來的 160 個暫存器永遠躺在 freelist 裡，但 `be_iq` 的 wakeup matrix
+  每條 entry 還是得付 256 bit）
+* 現況 PRF 64 只有 `64-32 = 32` 個 freelist 名額，卻要餵 64 個 ROB entry
+  —— 這正好解釋 rename stall 51%
+
+**建議 sweep 點：64 / 80 / 96 / 128，不要掃 256**（除非同時放寬 `ROB_W`）。
+從 PRF 64 -> 128，`be_iq` 狀態 4,688 -> 7,056 bit（+51%）換 rename stall 51% -> 0，
+這筆交易很划算；再往上就只剩成本沒有效益。
+
+### 7.5 `ci/gate_count.sh` 的 2× 問題（請監督者修）
+
+`yosys` 會印**兩個** `=== <module> ===` stat 區塊：`synth` 內建一次、我們最後 `stat` 一次。
+`gate_count.sh` 沒有過濾，把兩段都加總 → **gates 與 flops 都剛好是實際值的 2 倍**。
+
+實證（`be_dispatch`，狀態可以手算）：解析推導 `rob_tail(6) + 2 個 48-bit counter = 102`，
+raw stat 兩段各 `$_SDFFE_PP0P_ 102`，`gate_count.sh` 報 204。
+
+一行修法：把 `yosys ... | grep` 之間加一段只取最後一個區塊，例如
+`| tail -60 | awk '/^=== /{f=1} f'`。

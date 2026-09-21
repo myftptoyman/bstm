@@ -165,3 +165,26 @@ ooo_top（38,549 cells）bit-sliced vs Verilator
   test_working_set_fits_l2    ... ok
   Ran 2 tests — OK
 ```
+
+
+## v6（2026-09-21 20:00）— stall 歸因
+
+| # | 問題 | 裁決 |
+|---|---|---|
+| 33 | `cnt_st_rename` 把下游回壓（IQ/LSQ/ROB/MSHR 滿）記在自己頭上，與下游 counter 重複計數 | 拆成 `cnt_st_rename`（只計 freelist）+ 新增 `cnt_st_backpressure`。兩者由 `enough_free` 互斥 |
+| 34 | `cnt_st_iq` 與 `cnt_st_lsq` 定義不對等：前者不管有沒有 uop 要送都計、且 `ds_ready` 是「4 格全空」；後者只計真的被擋 | 記錄為已知不對等，比較兩者時必須註明。灌水的 `st_iq` 仍小於 `st_lsq` |
+| 35 | `cnt_st_fetch` 把 flush 後 decode queue 重填的拍算進「前端斷流」，真正來源是誤預測 | 新增 `cnt_st_refill`。**要求：新舊兩個 counter 相加恰好等於舊值**（互斥切分，非新增或排除） |
+| 36 | `ci/gate_count.sh` 把 yosys 兩段 `=== module ===` stat 都加總 | 加 `awk '/^=== /{n++} n>=2'`。先前發表的所有 gate/flop 數皆為 2 倍 |
+| 37 | 三個 agent 在 `/tmp` 共用 scratch，Agent F 誤刪 Agent D 的工作 | 分配專屬路徑 `/tmp/agent{d,e,f}_prf/`。**CONTRACT 原本只定義 repo 內的所有權，漏了 `/tmp`** |
+
+### §8 stall 歸因原則（新增，強制）
+
+1. **每個 stall cycle 恰好歸因到一個來源，且必須是真正的來源。** 下游回壓不可記在上游。
+2. **重構 counter 時必須能證明新舊集合的和相等**，不是「看起來合理」。
+3. **counter 的定義必須對等**，否則不可互相比較。
+4. **斷言用「精確等於」而非「≥」** —— 只有 `== +5` 抓得到重複計數。
+
+### §9 sweep 方法論（新增）
+
+1. **成本是量化的**：規則 2 的 max-size + mask 讓 `cfg=48` 與 `cfg=64` 成本相同。IQ 只能選 32/64，LDQ/STQ 只能選 16/32。中間值有 IPC 意義、無成本意義。
+2. **`full` 訊號可能是協定假象**：用 Little's Law 反推平均佔用，與 `full` 的觸發率對照。本例 LSQ 平均佔用 25% 卻有 22% 時間報滿 → all-or-nothing 協定造成，加 entry 無效。

@@ -23,12 +23,16 @@ module fe_front (
     output wire [`W*`DUOP_W-1:0] de_duop,
     input  wire                  de_ready,
     output wire [47:0]           cnt_st_fetch,
+    output wire [47:0]           cnt_st_refill,
     output wire [47:0]           cnt_mispred
 );
 
 // ---------------- 參數 ----------------
-localparam DQ_N = 16;            // decode queue 深度
-localparam DQ_W = `DUOP_W;       // 32
+localparam DQ_N  = 16;           // decode queue 深度
+localparam DQ_W  = `DUOP_W;      // 解碼後 uop 寬度（跟著巨集走）
+// CNT_B「碰巧」是 6，但它是 48-bit counter 的 8-bit 分段數，
+// 與 `PRF_W / `ROB_W 無關，做 PRF/ROB sweep 時不可跟著改。
+localparam CNT_B = 6;
 
 // ---------------- FE_* 事件位元（include/bstf.h）----------------
 // [1:0] bubbles  [2] ubtb_hit  [3] btb_override  [4] dir_ok
@@ -44,6 +48,7 @@ reg  [4:0]           dq_cnt_q;    // 0..16
 reg  [1:0]           bub_q;       // 尚未消化的前端泡泡
 reg                  blk_seen_q;  // 目前 head 的 fetch block 事件已取用
 reg                  shadow_q;    // 1 = 目前走 wrong path
+reg                  refill_q;    // 1 = flush 之後還沒成功送出過 uop（重填視窗）
 
 // ================= 輸出側（送往 rename）=================
 // 一次最多呈現 4 條；de_ready = 1 代表「本拍把 de_valid 全收下」（all-or-nothing）
@@ -136,12 +141,14 @@ always @(posedge clk) begin
         bub_q      <= 2'd0;
         blk_seen_q <= 1'b0;
         shadow_q   <= 1'b0;
+        refill_q   <= 1'b0;      // reset 不是 flush：冷啟動的填管線算 cnt_st_fetch
     end else if (flush) begin
         // 後端 flush：清 decode queue、回正確路徑、重新抓 block 事件
         dq_cnt_q   <= 5'd0;
         bub_q      <= 2'd0;
         blk_seen_q <= 1'b0;
         shadow_q   <= 1'b0;
+        refill_q   <= 1'b1;      // 進入重填視窗
     end else begin
         dq_q       <= dq_nxt;
         dq_cnt_q   <= rem + {2'b00, n_in};
@@ -149,21 +156,32 @@ always @(posedge clk) begin
         blk_seen_q <= blk_end_taken ? 1'b0 :
                       ((~blk_seen_q & fb_valid[0]) ? 1'b1 : blk_seen_q);
         shadow_q   <= mis_now ? 1'b1 : shadow_q;
+        // 成功送出 uop（all-or-nothing 傳遞）就離開重填視窗
+        refill_q   <= (de_ready & (de_valid != {`W{1'b0}})) ? 1'b0 : refill_q;
     end
 end
 
 // ================= counter（6 段 8-bit 進位鏈，無寬算術）=================
-// cnt_st_fetch：下游可收但前端交不出 uop 的 cycle 數（真正的前端斷流）
-wire c_stf_inc = de_ready & (de_valid == 4'd0) & ~flush;
+// 歸因原則：一個 stall cycle 只能有一個擁有者，而且必須是真正的來源。
+// 「下游收得下、但前端一條 uop 都交不出來」這個集合被切成互斥的兩半：
+//   cnt_st_fetch  = 真正的前端斷流（I-cache 泡泡、fetch buffer 空）
+//   cnt_st_refill = flush 之後到第一次成功送出 uop 之間的重填拍，
+//                   真正的來源是誤預測而不是 fetch 頻寬
+// 兩者相加 == 舊版的 cnt_st_fetch，一拍都沒有多算也沒有漏掉。
+// flush 當拍本身兩邊都不計（那是誤預測懲罰，事件記在 cnt_mispred）。
+wire starve    = de_ready & (de_valid == {`W{1'b0}}) & ~flush;
+wire c_stf_inc = starve & ~refill_q;
+wire c_rfl_inc = starve &  refill_q;
 reg  [47:0] c_stf_q;
-wire [4:0]  c_stf_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [5:0]  c_stf_car;
+wire [CNT_B-2:0] c_stf_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
+wire [CNT_B-1:0] c_stf_car;
 genvar gs;
 generate
-for (gs = 0; gs < 5; gs = gs + 1) begin : g_stf
+for (gs = 0; gs < CNT_B-1; gs = gs + 1) begin : g_stf
     assign c_stf_ff[gs] = (c_stf_q[8*gs +: 8] == 8'hFF);
 end
 endgenerate
+// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
 assign c_stf_car[0] = c_stf_inc;
 assign c_stf_car[1] = c_stf_inc & c_stf_ff[0];
 assign c_stf_car[2] = c_stf_inc & (&c_stf_ff[1:0]);
@@ -174,11 +192,11 @@ assign c_stf_car[5] = c_stf_inc & (&c_stf_ff[4:0]);
 // cnt_mispred：前端偵測到的方向誤預測（切 shadow 的次數）
 wire c_mis_inc = mis_now;
 reg  [47:0] c_mis_q;
-wire [4:0]  c_mis_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [5:0]  c_mis_car;
+wire [CNT_B-2:0] c_mis_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
+wire [CNT_B-1:0] c_mis_car;
 genvar gm;
 generate
-for (gm = 0; gm < 5; gm = gm + 1) begin : g_mis
+for (gm = 0; gm < CNT_B-1; gm = gm + 1) begin : g_mis
     assign c_mis_ff[gm] = (c_mis_q[8*gm +: 8] == 8'hFF);
 end
 endgenerate
@@ -189,20 +207,41 @@ assign c_mis_car[3] = c_mis_inc & (&c_mis_ff[2:0]);
 assign c_mis_car[4] = c_mis_inc & (&c_mis_ff[3:0]);
 assign c_mis_car[5] = c_mis_inc & (&c_mis_ff[4:0]);
 
+// cnt_st_refill：flush 後的重填拍
+reg  [47:0] c_rfl_q;
+wire [CNT_B-2:0] c_rfl_ff;
+wire [CNT_B-1:0] c_rfl_car;
+genvar gf;
+generate
+for (gf = 0; gf < CNT_B-1; gf = gf + 1) begin : g_rfl
+    assign c_rfl_ff[gf] = (c_rfl_q[8*gf +: 8] == 8'hFF);
+end
+endgenerate
+// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
+assign c_rfl_car[0] = c_rfl_inc;
+assign c_rfl_car[1] = c_rfl_inc & c_rfl_ff[0];
+assign c_rfl_car[2] = c_rfl_inc & (&c_rfl_ff[1:0]);
+assign c_rfl_car[3] = c_rfl_inc & (&c_rfl_ff[2:0]);
+assign c_rfl_car[4] = c_rfl_inc & (&c_rfl_ff[3:0]);
+assign c_rfl_car[5] = c_rfl_inc & (&c_rfl_ff[4:0]);
+
 integer ic;
 always @(posedge clk) begin
     if (rst) begin
         c_stf_q <= 48'd0;
         c_mis_q <= 48'd0;
+        c_rfl_q <= 48'd0;
     end else begin
-        for (ic = 0; ic < 6; ic = ic + 1) begin
+        for (ic = 0; ic < CNT_B; ic = ic + 1) begin
             if (c_stf_car[ic]) c_stf_q[8*ic +: 8] <= c_stf_q[8*ic +: 8] + 8'd1;
             if (c_mis_car[ic]) c_mis_q[8*ic +: 8] <= c_mis_q[8*ic +: 8] + 8'd1;
+            if (c_rfl_car[ic]) c_rfl_q[8*ic +: 8] <= c_rfl_q[8*ic +: 8] + 8'd1;
         end
     end
 end
 
-assign cnt_st_fetch = c_stf_q;
-assign cnt_mispred  = c_mis_q;
+assign cnt_st_fetch  = c_stf_q;
+assign cnt_st_refill = c_rfl_q;
+assign cnt_mispred   = c_mis_q;
 
 endmodule

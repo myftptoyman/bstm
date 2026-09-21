@@ -162,6 +162,43 @@ miss），只佔一個 entry。demo 沒有位址，無從判斷是否同 line，
 
 ---
 
+## 5b. 寬度參數化（PRF / ROB sweep）
+
+本模組**沒有任何硬編的 PRF / ROB 寬度**。所有帶實體暫存器或 ROB index 的欄位
+都走 `` `PRF_W `` / `` `ROB_W ``：
+
+| 走 `` `ROB_W `` | 走 `` `PRF_W `` |
+|---|---|
+| `ld_rob` `st_rob` `ms_rob` `hl_rob` `pq_rob` `d_rob` `sr0/1` `g_rob0/1` `c_rob` | `ld_prf` `st_prf` `ms_prf` `hl_prf` `d_prf` `g_prf0/1` `c_prf` |
+
+注意 `ld_rob`/`ld_prf`（及 st/ms/hl 的對應項）**必須分開宣告** —— 它們原本共用
+一個 `[N*6-1:0]`，PRF 與 ROB 寬度分家之後合併宣告就錯了。
+
+**不隨 PRF/ROB 變動的 6：** mem-event FIFO 的 payload 是
+`MEV_W = 6`（`{lat_class(4), level(2)}`），以及 `me_cnt`（MQN=32 的佔用計數）。
+已經具名成 `MEV_W` 並加註解，避免下次 sweep 被誤改。
+
+**LSQ index 欄位**（`ld_wid` `ms_ldq` `hl_idx`，各 4 bit）綁的是
+`LDN`/`STN` = 16（CONTRACT §0 的 MAX 表固定），不是 PRF/ROB，不需要跟著掃。
+
+### 驗證結果
+
+`` `PRF_W `` = 6 / 7 / 8（`PRF_N` = 64 / 128 / 256，`RUOP_W` = 40 / 48 / 48，
+`RUOP_D` / `RUOP_S1` / `RUOP_S2` 隨 `PRF_W` 加寬）三種都：
+
+| `PRF_W` | verilator `-Wall` | yosys `check -assert` | cells | flop bits |
+|---|---|---|---:|---:|
+| 6 | 0 warning 0 error | 0 problems | 12,743 | 1,556 |
+| 7 | 0 warning 0 error | 0 problems | 12,748 | 1,612 |
+| 8 | 0 warning 0 error | 0 problems | 12,748 | 1,668 |
+
+flop 增量 = **每 PRF bit +56**（LDQ 16 + STQ 16 + MSHR 8 + 延遲線 16 = 56 個
+`prf` 欄位），跟解析預期完全吻合 —— 代表寬度真的打通了，沒有被靜默截斷。
+
+**成本結論：PRF sweep 對本模組幾乎是免費的**（64→256 只多 112 個 flop、
+gate 數在雜訊內）。PRF 大小在 `lsu_q` 已經不是結構性維度，
+可以跟別的配置塞進同一個 bit-slice batch。
+
 ## 6. `cfg_mshr_entries` 未接線
 
 `top.v` 沒有把 `cfg_mshr_entries` 接到 `lsu_q`。監督者已確認**維持固定

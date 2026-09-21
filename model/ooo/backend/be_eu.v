@@ -110,6 +110,11 @@ module be_eu (
         oh64 = {`PRF_N{1'b0}};
         for (q = 0; q < `PRF_N; q = q + 1) if (q[`PRF_W-1:0] == ix) oh64[q] = 1'b1;
     end endfunction
+    // PRF_W 與 ROB_W 不再相等（PRF 可 sweep），ROB one-hot 要自己一份
+    function [`ROB_N-1:0] ohrob; input [`ROB_W-1:0] ix; integer q; begin
+        ohrob = {`ROB_N{1'b0}};
+        for (q = 0; q < `ROB_N; q = q + 1) if (q[`ROB_W-1:0] == ix) ohrob[q] = 1'b1;
+    end endfunction
 
     assign wb_valid    = r_wb_v;
     assign wb_prf      = r_wb_prf;
@@ -159,8 +164,8 @@ module be_eu (
             insn_v  = iss_valid[ek] & ~is_mem & (lat >= 4'd2);
             mem_iss[ek] = iss_valid[ek] & is_mem;
             if (iss_valid[ek] & is_mem) begin
-                if (u[`RUOP_DV]) mdv_set = mdv_set | oh64(iss_robidx[ek*`ROB_W +: `ROB_W]);
-                else             mdv_clr = mdv_clr | oh64(iss_robidx[ek*`ROB_W +: `ROB_W]);
+                if (u[`RUOP_DV]) mdv_set = mdv_set | ohrob(iss_robidx[ek*`ROB_W +: `ROB_W]);
+                else             mdv_clr = mdv_clr | ohrob(iss_robidx[ek*`ROB_W +: `ROB_W]);
             end
             if (iss_valid[ek] & u[`RUOP_DV] & (is_mem | (lat >= 4'd2)))
                 clr_m = clr_m | oh64(u[`RUOP_D]);

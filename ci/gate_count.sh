@@ -12,7 +12,7 @@ for top in "$@"; do
     synth -flatten -top $top
     abc -g AND,OR,XOR,NAND,NOR,XNOR
     opt_clean
-    stat" 2>&1)
+    stat" 2>&1 | awk '/^=== /{n++} n>=2')   # 只取最後一個 stat 區塊（E 發現：yosys 會印兩段，先前全部數字都是 2 倍）
   g=$(echo "$out" | grep -cE '^\s+\$_(AND|OR|XOR|NAND|NOR|XNOR|NOT)_' )
   cells=$(echo "$out" | grep 'Number of cells:' | tail -1 | awk '{print $NF}')
   ff=$(echo "$out" | grep -E '\$_(SDFF|DFF)' | awk '{s+=$2} END{print s+0}')

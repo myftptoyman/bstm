@@ -57,11 +57,14 @@ module lsu_q (
     localparam HS  = HD * 2;   // 每級 2 個 slot
     localparam PQN = 8;        // LSU 請求緩衝深度
     localparam MQN = 32;       // mem-event side FIFO 深度（>= decode queue 16 + rename）
+    localparam MEV_W = 6;      // mem event payload = {lat_class(4), level(2)}
+                               // 跟 PRF_W/ROB_W 無關，不要跟著 PRF sweep 改
 
     // ================= 狀態暫存器 =================
     // ---- LDQ ----
     reg [LDN-1:0]      ld_v, ld_ar, ld_st, ld_blk, ld_dn;
-    reg [LDN*6-1:0]    ld_rob, ld_prf;
+    reg [LDN*`ROB_W-1:0] ld_rob;
+    reg [LDN*`PRF_W-1:0] ld_prf;
     reg [LDN*2-1:0]    ld_lvl;      // MEM_LEVEL
     reg [LDN*4-1:0]    ld_lc;       // MEM_LAT_CLASS
     reg [LDN*4-1:0]    ld_wid;      // 卡住這條 load 的 STQ index
@@ -70,28 +73,31 @@ module lsu_q (
 
     // ---- STQ ----
     reg [STN-1:0]      st_v, st_ar, st_st, st_dn, st_noacc;
-    reg [STN*6-1:0]    st_rob, st_prf;
+    reg [STN*`ROB_W-1:0] st_rob;
+    reg [STN*`PRF_W-1:0] st_prf;
     reg [3:0]          st_head, st_tail;
     reg [4:0]          st_cnt;
 
     // ---- MSHR ----
     reg [MSN-1:0]      ms_v, ms_dead;
     reg [MSN*8-1:0]    ms_cnt;
-    reg [MSN*6-1:0]    ms_rob, ms_prf;
+    reg [MSN*`ROB_W-1:0] ms_rob;
+    reg [MSN*`PRF_W-1:0] ms_prf;
     reg [MSN*4-1:0]    ms_ldq;
 
     // ---- L1-hit 延遲線（slot s -> stage s>>1）----
     reg [HS-1:0]       hl_v, hl_q;      // hl_q: 1=STQ 0=LDQ
-    reg [HS*6-1:0]     hl_rob, hl_prf;
+    reg [HS*`ROB_W-1:0]  hl_rob;
+    reg [HS*`PRF_W-1:0]  hl_prf;
     reg [HS*4-1:0]     hl_idx;
 
     // ---- LSU 請求緩衝（環狀 FIFO）----
-    reg [PQN*6-1:0]    pq_rob;
+    reg [PQN*`ROB_W-1:0] pq_rob;
     reg [2:0]          pq_head, pq_tail;
     reg [3:0]          pq_cnt;
 
     // ---- mem-event side FIFO：每筆只存 {lat_class[3:0], level[1:0]} = 6 bit ----
-    reg [MQN*6-1:0]    me_q;
+    reg [MQN*MEV_W-1:0] me_q;
     reg [4:0]          me_head, me_tail;   // MQN=32 -> 指標自然折返
     reg [5:0]          me_cnt;
 
@@ -102,31 +108,35 @@ module lsu_q (
 
     // ================= next-state =================
     reg [LDN-1:0]      n_ld_v, n_ld_ar, n_ld_st, n_ld_blk, n_ld_dn;
-    reg [LDN*6-1:0]    n_ld_rob, n_ld_prf;
+    reg [LDN*`ROB_W-1:0] n_ld_rob;
+    reg [LDN*`PRF_W-1:0] n_ld_prf;
     reg [LDN*2-1:0]    n_ld_lvl;
     reg [LDN*4-1:0]    n_ld_lc, n_ld_wid;
     reg [3:0]          n_ld_head, n_ld_tail;
     reg [4:0]          n_ld_cnt;
 
     reg [STN-1:0]      n_st_v, n_st_ar, n_st_st, n_st_dn, n_st_noacc;
-    reg [STN*6-1:0]    n_st_rob, n_st_prf;
+    reg [STN*`ROB_W-1:0] n_st_rob;
+    reg [STN*`PRF_W-1:0] n_st_prf;
     reg [3:0]          n_st_head, n_st_tail;
     reg [4:0]          n_st_cnt;
 
     reg [MSN-1:0]      n_ms_v, n_ms_dead;
     reg [MSN*8-1:0]    n_ms_cnt;
-    reg [MSN*6-1:0]    n_ms_rob, n_ms_prf;
+    reg [MSN*`ROB_W-1:0] n_ms_rob;
+    reg [MSN*`PRF_W-1:0] n_ms_prf;
     reg [MSN*4-1:0]    n_ms_ldq;
 
     reg [HS-1:0]       n_hl_v, n_hl_q;
-    reg [HS*6-1:0]     n_hl_rob, n_hl_prf;
+    reg [HS*`ROB_W-1:0]  n_hl_rob;
+    reg [HS*`PRF_W-1:0]  n_hl_prf;
     reg [HS*4-1:0]     n_hl_idx;
 
-    reg [PQN*6-1:0]    n_pq_rob;
+    reg [PQN*`ROB_W-1:0] n_pq_rob;
     reg [2:0]          n_pq_head, n_pq_tail;
     reg [3:0]          n_pq_cnt;
 
-    reg [MQN*6-1:0]    n_me_q;
+    reg [MQN*MEV_W-1:0] n_me_q;
     reg [4:0]          n_me_head, n_me_tail;
     reg [5:0]          n_me_cnt;
 
@@ -134,7 +144,8 @@ module lsu_q (
     reg [47:0]         n_stmshr;
 
     reg [`W-1:0]       d_v;
-    reg [`W*6-1:0]     d_rob, d_prf;
+    reg [`W*`ROB_W-1:0] d_rob;
+    reg [`W*`PRF_W-1:0] d_prf;
 
     assign done_v      = d_v;
     assign done_rob    = d_rob;
@@ -202,7 +213,7 @@ module lsu_q (
     reg        rv0, rv1;
     reg [3:0]  ri0, ri1;
     reg        sv0, sv1;
-    reg [5:0]  sr0, sr1;
+    reg [`ROB_W-1:0] sr0, sr1;
     reg [2:0]  ph, pt;
     reg [1:0]  nsv;
     reg [2:0]  nacc;
@@ -213,11 +224,13 @@ module lsu_q (
     reg [3:0]  g_idx0, g_idx1;
     reg [3:0]  g_lc0,  g_lc1;
     reg [1:0]  g_lvl0, g_lvl1;
-    reg [5:0]  g_rob0, g_rob1, g_prf0, g_prf1;
+    reg [`ROB_W-1:0] g_rob0, g_rob1;
+    reg [`PRF_W-1:0] g_prf0, g_prf1;
 
     reg [3:0]  c_idx, c_lc;
     reg [1:0]  c_lvl;
-    reg [5:0]  c_rob, c_prf;
+    reg [`ROB_W-1:0] c_rob;
+    reg [`PRF_W-1:0] c_prf;
     reg        c_isld;
     reg [7:0]  c_lat;
     reg [2:0]  c_tgt;
@@ -232,16 +245,16 @@ module lsu_q (
     reg [3:0]  a_ldt, a_stt;
     reg [4:0]  a_ldc, a_stc;
     // verilator lint_off UNUSEDSIGNAL
-    reg [31:0] u;
+    reg [`RUOP_W-1:0] u;
     reg [3:0]  ucls;
     reg [7:0]  uev;
     // verilator lint_on UNUSEDSIGNAL
     reg        is_ld, is_st, is_amo, is_mem;
     reg [4:0]  mh, mt;
     reg [2:0]  nmpop, nmpush;
-    reg [5:0]  evq;
+    reg [MEV_W-1:0] evq;
     // verilator lint_off UNUSEDSIGNAL
-    reg [31:0] du;
+    reg [`DUOP_W-1:0] du;
     reg [3:0]  dcls;
     // verilator lint_on UNUSEDSIGNAL
     reg        ftk;
@@ -270,7 +283,7 @@ module lsu_q (
         n_ms_rob = ms_rob; n_ms_prf = ms_prf; n_ms_ldq = ms_ldq;
 
         n_hl_v = {HS{1'b0}}; n_hl_q = {HS{1'b0}};
-        n_hl_rob = {HS*6{1'b0}}; n_hl_prf = {HS*6{1'b0}};
+        n_hl_rob = {HS*`ROB_W{1'b0}}; n_hl_prf = {HS*`PRF_W{1'b0}};
         n_hl_idx = {HS*4{1'b0}};
 
         n_pq_rob = pq_rob; n_pq_head = pq_head;
@@ -279,28 +292,31 @@ module lsu_q (
         n_me_tail = me_tail; n_me_cnt = me_cnt;
         n_stmshr = stmshr;
 
-        d_v = {`W{1'b0}}; d_rob = {`W*6{1'b0}}; d_prf = {`W*6{1'b0}};
+        d_v = {`W{1'b0}}; d_rob = {`W*`ROB_W{1'b0}}; d_prf = {`W*`PRF_W{1'b0}};
 
         mshr_stall = 1'b0;
         ndl_ld = 2'd0; ndl_st = 2'd0;
         sdv0 = 1'b0; sdv1 = 1'b0; sdi0 = 4'd0; sdi1 = 4'd0;
         nrep = 2'd0; ngr = 2'd0;
         rv0 = 1'b0; rv1 = 1'b0; ri0 = 4'd0; ri1 = 4'd0;
-        sv0 = 1'b0; sv1 = 1'b0; sr0 = 6'd0; sr1 = 6'd0;
+        sv0 = 1'b0; sv1 = 1'b0;
+        sr0 = {`ROB_W{1'b0}}; sr1 = {`ROB_W{1'b0}};
         ph = pq_head; pt = pq_tail; nsv = 2'd0; nacc = 3'd0; pcnt = 4'd0;
         g_val = 2'b00; g_isld = 2'b00;
         g_idx0 = 4'd0; g_idx1 = 4'd0; g_lc0 = 4'd0; g_lc1 = 4'd0;
         g_lvl0 = 2'd0; g_lvl1 = 2'd0;
-        g_rob0 = 6'd0; g_rob1 = 6'd0; g_prf0 = 6'd0; g_prf1 = 6'd0;
-        c_idx = 4'd0; c_lc = 4'd0; c_lvl = 2'd0; c_rob = 6'd0; c_prf = 6'd0;
+        g_rob0 = {`ROB_W{1'b0}}; g_rob1 = {`ROB_W{1'b0}};
+        g_prf0 = {`PRF_W{1'b0}}; g_prf1 = {`PRF_W{1'b0}};
+        c_idx = 4'd0; c_lc = 4'd0; c_lvl = 2'd0;
+        c_rob = {`ROB_W{1'b0}}; c_prf = {`PRF_W{1'b0}};
         c_isld = 1'b0; c_lat = 8'd0; c_tgt = 3'd0;
         placed = 1'b0; got_ms = 1'b0; ms_sel = 4'd0;
         dh = 4'd0; hv_ = 1'b0; hd_ = 1'b0;
         rnd = 8'd0; nld_lane = 3'd0; conflict = 1'b0; wid_i = 4'd0;
-        u = 32'd0; ucls = 4'd0; uev = 8'd0;
+        u = {`RUOP_W{1'b0}}; ucls = 4'd0; uev = 8'd0;
         is_ld = 1'b0; is_st = 1'b0; is_amo = 1'b0; is_mem = 1'b0; tmp5 = 5'd0;
         mh = me_head; mt = me_tail; nmpop = 3'd0; nmpush = 3'd0;
-        evq = 6'd0; du = 32'd0; dcls = 4'd0; ftk = 1'b0;
+        evq = {MEV_W{1'b0}}; du = {`DUOP_W{1'b0}}; dcls = 4'd0; ftk = 1'b0;
         a_ldt = 4'd0; a_stt = 4'd0; a_ldc = 5'd0; a_stc = 5'd0;
         la1 = 8'd0; la2 = 8'd0; la3 = 8'd0; la4 = 8'd0;
         lb0 = 8'd0; lb1 = 8'd0; lb2 = 8'd0; lb3 = 8'd0; lb4 = 8'd0;
@@ -360,8 +376,8 @@ module lsu_q (
         for (s = 0; s < 2; s = s + 1)
             if (hl_v[s]) begin
                 d_v[s] = 1'b1;
-                d_rob[s*6 +: 6] = hl_rob[s*6 +: 6];
-                d_prf[s*6 +: 6] = hl_prf[s*6 +: 6];
+                d_rob[s*`ROB_W +: `ROB_W] = hl_rob[s*`ROB_W +: `ROB_W];
+                d_prf[s*`PRF_W +: `PRF_W] = hl_prf[s*`PRF_W +: `PRF_W];
                 if (hl_q[s]) begin
                     for (e = 0; e < STN; e = e + 1)
                         if (e[3:0] == hl_idx[s*4 +: 4]) n_st_dn[e] = 1'b1;
@@ -375,8 +391,8 @@ module lsu_q (
         for (s = 0; s < HS - 2; s = s + 1) begin
             n_hl_v[s]          = hl_v[s+2];
             n_hl_q[s]          = hl_q[s+2];
-            n_hl_rob[s*6 +: 6] = hl_rob[(s+2)*6 +: 6];
-            n_hl_prf[s*6 +: 6] = hl_prf[(s+2)*6 +: 6];
+            n_hl_rob[s*`ROB_W +: `ROB_W] = hl_rob[(s+2)*`ROB_W +: `ROB_W];
+            n_hl_prf[s*`PRF_W +: `PRF_W] = hl_prf[(s+2)*`PRF_W +: `PRF_W];
             n_hl_idx[s*4 +: 4] = hl_idx[(s+2)*4 +: 4];
         end
 
@@ -393,13 +409,13 @@ module lsu_q (
                 end else if (nrep < 2'd2) begin
                     if (nrep == 2'd0) begin
                         d_v[2] = 1'b1;
-                        d_rob[2*6 +: 6] = ms_rob[m*6 +: 6];
-                        d_prf[2*6 +: 6] = ms_prf[m*6 +: 6];
+                        d_rob[2*`ROB_W +: `ROB_W] = ms_rob[m*`ROB_W +: `ROB_W];
+                        d_prf[2*`PRF_W +: `PRF_W] = ms_prf[m*`PRF_W +: `PRF_W];
                         rv0 = 1'b1; ri0 = ms_ldq[m*4 +: 4];
                     end else begin
                         d_v[3] = 1'b1;
-                        d_rob[3*6 +: 6] = ms_rob[m*6 +: 6];
-                        d_prf[3*6 +: 6] = ms_prf[m*6 +: 6];
+                        d_rob[3*`ROB_W +: `ROB_W] = ms_rob[m*`ROB_W +: `ROB_W];
+                        d_prf[3*`PRF_W +: `PRF_W] = ms_prf[m*`PRF_W +: `PRF_W];
                         rv1 = 1'b1; ri1 = ms_ldq[m*4 +: 4];
                     end
                     n_ms_v[m] = 1'b0;
@@ -416,26 +432,26 @@ module lsu_q (
         if (pq_cnt > 4'd0) begin
             sv0 = 1'b1;
             for (j = 0; j < PQN; j = j + 1)
-                if (j[2:0] == ph) sr0 = pq_rob[j*6 +: 6];
+                if (j[2:0] == ph) sr0 = pq_rob[j*`ROB_W +: `ROB_W];
             ph = ph + 3'd1; nsv = 2'd1;
         end
         if (pq_cnt > 4'd1) begin
             sv1 = 1'b1;
             for (j = 0; j < PQN; j = j + 1)
-                if (j[2:0] == ph) sr1 = pq_rob[j*6 +: 6];
+                if (j[2:0] == ph) sr1 = pq_rob[j*`ROB_W +: `ROB_W];
             ph = ph + 3'd1; nsv = 2'd2;
         end
         n_pq_head = ph;
 
         for (e = 0; e < LDN; e = e + 1)
             if (n_ld_v[e] & ~n_ld_ar[e] &
-                ((sv0 & (n_ld_rob[e*6 +: 6] == sr0)) |
-                 (sv1 & (n_ld_rob[e*6 +: 6] == sr1))))
+                ((sv0 & (n_ld_rob[e*`ROB_W +: `ROB_W] == sr0)) |
+                 (sv1 & (n_ld_rob[e*`ROB_W +: `ROB_W] == sr1))))
                 n_ld_ar[e] = 1'b1;
         for (e = 0; e < STN; e = e + 1)
             if (n_st_v[e] & ~n_st_ar[e] &
-                ((sv0 & (n_st_rob[e*6 +: 6] == sr0)) |
-                 (sv1 & (n_st_rob[e*6 +: 6] == sr1))))
+                ((sv0 & (n_st_rob[e*`ROB_W +: `ROB_W] == sr0)) |
+                 (sv1 & (n_st_rob[e*`ROB_W +: `ROB_W] == sr1))))
                 n_st_ar[e] = 1'b1;
 
         // ---------- 8a. 記憶體埠仲裁：最多 2 個存取 / cycle（load 優先）------
@@ -445,11 +461,11 @@ module lsu_q (
                 if (ngr == 2'd0) begin
                     g_val[0] = 1'b1; g_isld[0] = 1'b1; g_idx0 = e[3:0];
                     g_lc0  = n_ld_lc[e*4 +: 4];  g_lvl0 = n_ld_lvl[e*2 +: 2];
-                    g_rob0 = n_ld_rob[e*6 +: 6]; g_prf0 = n_ld_prf[e*6 +: 6];
+                    g_rob0 = n_ld_rob[e*`ROB_W +: `ROB_W]; g_prf0 = n_ld_prf[e*`PRF_W +: `PRF_W];
                 end else begin
                     g_val[1] = 1'b1; g_isld[1] = 1'b1; g_idx1 = e[3:0];
                     g_lc1  = n_ld_lc[e*4 +: 4];  g_lvl1 = n_ld_lvl[e*2 +: 2];
-                    g_rob1 = n_ld_rob[e*6 +: 6]; g_prf1 = n_ld_prf[e*6 +: 6];
+                    g_rob1 = n_ld_rob[e*`ROB_W +: `ROB_W]; g_prf1 = n_ld_prf[e*`PRF_W +: `PRF_W];
                 end
                 ngr = ngr + 2'd1;
             end
@@ -459,11 +475,11 @@ module lsu_q (
                 if (ngr == 2'd0) begin
                     g_val[0] = 1'b1; g_isld[0] = 1'b0; g_idx0 = e[3:0];
                     g_lc0 = 4'd10; g_lvl0 = 2'd0;
-                    g_rob0 = n_st_rob[e*6 +: 6]; g_prf0 = n_st_prf[e*6 +: 6];
+                    g_rob0 = n_st_rob[e*`ROB_W +: `ROB_W]; g_prf0 = n_st_prf[e*`PRF_W +: `PRF_W];
                 end else begin
                     g_val[1] = 1'b1; g_isld[1] = 1'b0; g_idx1 = e[3:0];
                     g_lc1 = 4'd10; g_lvl1 = 2'd0;
-                    g_rob1 = n_st_rob[e*6 +: 6]; g_prf1 = n_st_prf[e*6 +: 6];
+                    g_rob1 = n_st_rob[e*`ROB_W +: `ROB_W]; g_prf1 = n_st_prf[e*`PRF_W +: `PRF_W];
                 end
                 ngr = ngr + 2'd1;
             end
@@ -494,8 +510,8 @@ module lsu_q (
                                 n_ms_v[m]          = 1'b1;
                                 n_ms_dead[m]       = 1'b0;
                                 n_ms_cnt[m*8 +: 8] = c_lat;
-                                n_ms_rob[m*6 +: 6] = c_rob;
-                                n_ms_prf[m*6 +: 6] = c_prf;
+                                n_ms_rob[m*`ROB_W +: `ROB_W] = c_rob;
+                                n_ms_prf[m*`PRF_W +: `PRF_W] = c_prf;
                                 n_ms_ldq[m*4 +: 4] = c_idx;
                             end
                         for (e = 0; e < LDN; e = e + 1)
@@ -514,8 +530,8 @@ module lsu_q (
                         if (~placed & (s[3:1] == c_tgt) & ~n_hl_v[s]) begin
                             n_hl_v[s]          = 1'b1;
                             n_hl_q[s]          = ~c_isld;
-                            n_hl_rob[s*6 +: 6] = c_rob;
-                            n_hl_prf[s*6 +: 6] = c_prf;
+                            n_hl_rob[s*`ROB_W +: `ROB_W] = c_rob;
+                            n_hl_prf[s*`PRF_W +: `PRF_W] = c_prf;
                             n_hl_idx[s*4 +: 4] = c_idx;
                             placed = 1'b1;
                         end
@@ -537,7 +553,8 @@ module lsu_q (
         for (i = 0; i < `W; i = i + 1)
             if (req_v[i] & ((pcnt + {1'b0, nacc}) < PQN[3:0])) begin
                 for (j = 0; j < PQN; j = j + 1)
-                    if (j[2:0] == pt) n_pq_rob[j*6 +: 6] = req_rob[i*`ROB_W +: 6];
+                    if (j[2:0] == pt)
+                        n_pq_rob[j*`ROB_W +: `ROB_W] = req_rob[i*`ROB_W +: `ROB_W];
                 pt   = pt + 3'd1;
                 nacc = nacc + 3'd1;
             end
@@ -561,10 +578,10 @@ module lsu_q (
             is_mem = is_ld | is_st;          // AMO 只算一筆 mem access
 
             // ---- 從 side FIFO 取出這條 mem uop 的 cache 事件 ----
-            evq = 6'd0;
+            evq = {MEV_W{1'b0}};
             if (is_mem & ({3'b000, nmpop} < me_cnt)) begin
                 for (j = 0; j < MQN; j = j + 1)
-                    if (j[4:0] == mh) evq = me_q[j*6 +: 6];
+                    if (j[4:0] == mh) evq = me_q[j*MEV_W +: MEV_W];
                 mh    = mh + 5'd1;
                 nmpop = nmpop + 3'd1;
             end
@@ -577,8 +594,8 @@ module lsu_q (
                         n_st_v[e]  = 1'b1;
                         n_st_ar[e] = 1'b0;
                         n_st_st[e] = 1'b0;
-                        n_st_rob[e*6 +: 6] = ds_robidx[i*`ROB_W +: 6];
-                        n_st_prf[e*6 +: 6] = u[`RUOP_D];
+                        n_st_rob[e*`ROB_W +: `ROB_W] = ds_robidx[i*`ROB_W +: `ROB_W];
+                        n_st_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D];
                         // AMO 的 STQ entry 只是排序佔位：不佔埠、不回報 done
                         n_st_noacc[e] = is_amo;
                         n_st_dn[e]    = is_amo;
@@ -608,8 +625,8 @@ module lsu_q (
                         n_ld_dn[e]  = 1'b0;
                         n_ld_blk[e] = conflict;
                         n_ld_wid[e*4 +: 4] = wid_i;
-                        n_ld_rob[e*6 +: 6] = ds_robidx[i*`ROB_W +: 6];
-                        n_ld_prf[e*6 +: 6] = u[`RUOP_D];
+                        n_ld_rob[e*`ROB_W +: `ROB_W] = ds_robidx[i*`ROB_W +: `ROB_W];
+                        n_ld_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D];
                         n_ld_lvl[e*2 +: 2] = uev[1:0];      // MEM_LEVEL
                         n_ld_lc[e*4 +: 4]  = uev[7:4];      // MEM_LAT_CLASS
                     end
@@ -632,7 +649,7 @@ module lsu_q (
                     & ((me_cnt - {3'b000, nmpop} + {3'b000, nmpush}) < MQN[5:0])) begin
                 for (j = 0; j < MQN; j = j + 1)
                     if (j[4:0] == mt)
-                        n_me_q[j*6 +: 6] = {fb_mem_event[i*8+4 +: 4],
+                        n_me_q[j*MEV_W +: MEV_W] = {fb_mem_event[i*8+4 +: 4],
                                             fb_mem_event[i*8 +: 2]};
                 mt     = mt + 5'd1;
                 nmpush = nmpush + 3'd1;
@@ -679,29 +696,29 @@ module lsu_q (
         if (rst) begin
             ld_v <= {LDN{1'b0}}; ld_ar <= {LDN{1'b0}}; ld_st <= {LDN{1'b0}};
             ld_blk <= {LDN{1'b0}}; ld_dn <= {LDN{1'b0}};
-            ld_rob <= {LDN*6{1'b0}}; ld_prf <= {LDN*6{1'b0}};
+            ld_rob <= {LDN*`ROB_W{1'b0}}; ld_prf <= {LDN*`PRF_W{1'b0}};
             ld_lvl <= {LDN*2{1'b0}}; ld_lc <= {LDN*4{1'b0}};
             ld_wid <= {LDN*4{1'b0}};
             ld_head <= 4'd0; ld_tail <= 4'd0; ld_cnt <= 5'd0;
 
             st_v <= {STN{1'b0}}; st_ar <= {STN{1'b0}}; st_st <= {STN{1'b0}};
             st_dn <= {STN{1'b0}}; st_noacc <= {STN{1'b0}};
-            st_rob <= {STN*6{1'b0}}; st_prf <= {STN*6{1'b0}};
+            st_rob <= {STN*`ROB_W{1'b0}}; st_prf <= {STN*`PRF_W{1'b0}};
             st_head <= 4'd0; st_tail <= 4'd0; st_cnt <= 5'd0;
 
             ms_v <= {MSN{1'b0}}; ms_dead <= {MSN{1'b0}};
             ms_cnt <= {MSN*8{1'b0}};
-            ms_rob <= {MSN*6{1'b0}}; ms_prf <= {MSN*6{1'b0}};
+            ms_rob <= {MSN*`ROB_W{1'b0}}; ms_prf <= {MSN*`PRF_W{1'b0}};
             ms_ldq <= {MSN*4{1'b0}};
 
             hl_v <= {HS{1'b0}}; hl_q <= {HS{1'b0}};
-            hl_rob <= {HS*6{1'b0}}; hl_prf <= {HS*6{1'b0}};
+            hl_rob <= {HS*`ROB_W{1'b0}}; hl_prf <= {HS*`PRF_W{1'b0}};
             hl_idx <= {HS*4{1'b0}};
 
-            pq_rob <= {PQN*6{1'b0}};
+            pq_rob <= {PQN*`ROB_W{1'b0}};
             pq_head <= 3'd0; pq_tail <= 3'd0; pq_cnt <= 4'd0;
 
-            me_q <= {MQN*6{1'b0}};
+            me_q <= {MQN*MEV_W{1'b0}};
             me_head <= 5'd0; me_tail <= 5'd0; me_cnt <= 6'd0;
 
             la <= 8'hA5; lb <= 8'h3C;

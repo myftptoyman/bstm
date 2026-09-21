@@ -134,11 +134,16 @@ slower than linear extrapolation predicts. This is now the top open problem.
 
 Gate-level (the honest metric — `proc; opt` cell counts are misleading by up to 12×):
 
-| module | proc/opt cells | gate-level gates |
-|---|---:|---:|
-| `be_iq` | 7,852 | **93,707** |
-| `lsu_q` | 12,743 | 27,949 |
-| `rn_rename` | 4,761 | 18,883 |
+| module | proc/opt cells | gate-level gates | flops |
+|---|---:|---:|---:|
+| `be_iq` | 7,852 | **81,737** | 4,688 |
+| `lsu_q` | 12,743 | 23,075 | 1,556 |
+| `rn_rename` | 4,761 | 14,531 | 546 |
+
+(An earlier revision of this file reported these gate counts at exactly twice their real
+value: `ci/gate_count.sh` summed both of the `=== module ===` blocks yosys emits — one from
+`synth`, one from the final `stat`. The module *ranking* was unaffected, which is why the
+error survived review. Three independent measurements now agree on the flop counts.)
 
 **Equivalence checking** — the safety net, and it is green:
 
@@ -174,9 +179,66 @@ shadow expansion is not implemented yet (`shadow_off` is 0 everywhere), so no mi
 penalty is ever paid. With a 4.93 % block mispredict rate and a ~12-cycle penalty, the true
 figure is likely nearer 1.0–1.1.
 
-The stall breakdown is the first genuine design finding the model has produced: rename
-dominates while the ROB is essentially never full. PRF 64 against ROB 64 is badly
-unbalanced — real 4-issue designs use 1.5–2x. That is a configuration conclusion, not a bug.
+### The physical register sweep, and why it mattered
+
+The stall table above looks like it says "rename is the bottleneck, the PRF is too small."
+That reading is wrong, and the sweep that tested it is the most useful thing this model has
+produced so far:
+
+| PRF | IPC | rename stall<br>(freelist) | ROB stall | ROB occupancy |
+|---|---|---:|---:|---:|
+| 64 | 1.381 | 61,457 | 141 | 28.5 |
+| 96 | 1.391 | 2,936 | 37,509 | 34.1 |
+| 128 | 1.391 | **0** | 40,445 | 34.1 |
+| 256 | 1.391 | **0** | 40,445 | 34.1 |
+
+**Quadrupling the physical register file moves IPC by 0.7 %.** Everything from 96 upwards is
+bit-identical, which was predicted from first principles before the sweep ran: live physical
+registers are bounded by 32 committed architectural mappings plus at most `ROB_N` = 64
+in-flight destinations, so 96 saturates by construction.
+
+The stall attribution was the problem, not the register file:
+
+```verilog
+// rn_rename.v
+wire c_rn_inc = (|de_valid) & (~rn_ready | ~enough_free) & ~flush;
+                               ^^^^^^^^^^ downstream backpressure
+// be_dispatch.v
+wire blocked = rob_full | lsq_full | mshr_full | (~ds_ready);
+assign rn_ready = ~blocked & ~flush;
+```
+
+A full IQ, LSQ, ROB or MSHR all lower `rn_ready`, and every one of those cycles was booked
+against rename — double-counted with the downstream counters that already recorded them.
+With the attribution fixed, freelist pressure reaches exactly zero at PRF 128, matching the
+first-principles bound. The earlier "stall stays at 245,580 regardless of PRF" reading was
+entirely an artefact of the counter.
+
+What the corrected sweep actually shows is a textbook Amdahl result: removing the rename
+bottleneck pushes pressure downstream, ROB stalls go from 141 cycles to 40,445 and ROB
+occupancy from 28.5 to 34.1, and IPC barely moves because the LSQ and IQ are waiting behind
+it. **A miscounted stall does not merely give the wrong number — it hides the trend, which
+is the thing design-space exploration exists to find.**
+
+Chasing it further turned up two more measurement problems, neither of which is a bug in the
+model:
+
+- **The counters are not defined symmetrically.** `cnt_st_lsq` only fires when a uop is
+  genuinely blocked; `cnt_st_iq` fires whenever `ds_ready` is low regardless of whether
+  anything wanted to issue. The inflated counter is still the smaller one, so real IQ
+  pressure is lower than 17 %.
+- **`lsq_full` is a threshold artefact.** By Little's Law the LSQ holds about 8 of its 32
+  entries on average (0.387 memory uops/cycle × 20.7 cycles of ROB residency), yet it reports
+  full 22 % of the time. The dispatch protocol is all-or-nothing — "fewer than 4 free slots"
+  counts as full. Adding LDQ/STQ entries would achieve nothing; the protocol is what needs
+  to change.
+
+**A sweep-design consequence worth knowing:** because the modelling rules require max-size
+structures with a runtime mask, `cfg_iq_entries = 48` costs exactly what 64 costs. IQ is
+really a choice between 32 and 64, LDQ/STQ between 16 and 32, and PRF 96 sits at the same
+cost point as 128. Intermediate values have IPC meaning but no cost meaning, so a
+cost/benefit curve has to be plotted against quantised cost points rather than configuration
+values.
 
 **CoreMark trace** (real Spike, 50 M instructions from steady state):
 
