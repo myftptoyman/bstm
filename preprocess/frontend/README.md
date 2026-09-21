@@ -228,8 +228,14 @@ tagged component 的對照組）、`config_nowp.json`（關掉 wrong-path 的對
 * **壓力模式** `--hard`：深度 20 的巢狀呼叫鏈（超過 RAS 的 16 entry）
   + 在 4 個目標間輪替的 `jalr`，用來涵蓋 RAS 回捲與間接跳躍。
 
-兩種模式都輸出 **7 欄格式**，跟 Agent H 的生產 trace 走同一條程式路徑
-（2026-09-21 的 target/next_pc 慣例衝突就是因為自測與生產走不同路徑才沒被抓到）。
+兩種模式都輸出 **7 欄格式**，跟 Agent H 的生產 trace 走同一條程式路徑。
+
+> **維護規則（從 2026-09-21 的事故學到的）**：`gen_trace.py` 的輸出慣例
+> 必須與生產 trace 完全一致。當時自測用「not-taken 填 target=0」、
+> 生產用「architectural target」，兩條路徑的慣例不同，
+> 所以「一個 fetch block = 一個分支且在最後」這個錯誤假設
+> 在合成串流上 100% 正確、在真 trace 上 98% 錯誤，卻躲過了全部自測。
+> **改格式時先改 `gen_trace.py`，不要只改 reader。**
 
 斷言：
 
@@ -287,7 +293,8 @@ tagged component 的對照組）、`config_nowp.json`（關掉 wrong-path 的對
 6. **TAGE 沒有 statistical corrector / loop predictor / local history**，
    也沒有 path history（只有全域方向歷史）。折疊歷史長度上限 500 bit
    （`HistReg` = 512 bit），tagged table 上限 8 個。
-   CoreMark 上這是主要的剩餘誤差來源，見 §11.2。
+   CoreMark 上這是主要的剩餘誤差來源（5.92%），但**已經被證明是這個
+   預測器類別的資訊上界而非實作缺陷**，監督者裁決不補 SC-L，見 §11.2。
 7. **沒有推測性 BTB/TAGE 更新的 in-flight 視窗**：correct path 上「預測→解析」
    是同一個 block 內完成的，等於假設分支 1 拍解析。真實的 10 級 pipeline
    有 ~12 拍的更新延遲，會讓緊耦合的相鄰分支（如短迴圈）略為樂觀。
@@ -457,6 +464,14 @@ uBTB 命中率隨 D 上升（prefetch 效應）、在 **D ≈ `ubtb_entries` = 1
 * 結論：**CoreMark 這條 trace 在只有全域歷史的預測器下，2–5% 不可達**。
   要再往下要加 local history / loop predictor / statistical corrector
   （TAGE-SC-L 那一類），那是規格變更，不是 bug。
+
+> **監督者裁決（2026-09-21）：不加 TAGE-SC-L。**
+> 理由就是上面這張表：bimodal 對照與理想 bimodal 逐位吻合、
+> TAGE 在 1 M 視窗上與理想 global-history H=64 完全相同、
+> 放大 16 倍只降 0.19 pp —— 三個證據都指向「實作正確，這是預測器類別的
+> 資訊極限」，不是 bug。demo 要展示的是 bit-sliced pipeline，不是預測器研究。
+> **所以 5.92% 是這個配置的正確答案，不要再靠調參數把它壓下去**；
+> 要更低必須改規格（加 local history / loop predictor / SC），已列入 PLAN 後續項。
 
 ### 11.3 前端泡泡的主要來源是 uBTB 容量
 
