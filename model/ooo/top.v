@@ -8,11 +8,11 @@ module ooo_top (
     input  wire                     rst,
 
     // ---- 每 lane 配置（runtime mask） ----
-    input  wire [6:0]               cfg_rob_entries,
-    input  wire [5:0]               cfg_iq_entries,
-    input  wire [4:0]               cfg_ldq_entries,
-    input  wire [4:0]               cfg_stq_entries,
-    input  wire [3:0]               cfg_mshr_entries,
+    input  wire [`ROB_W:0]               cfg_rob_entries,
+    input  wire [`IQ_W:0]               cfg_iq_entries,
+    input  wire [`LSQ_W:0]               cfg_ldq_entries,
+    input  wire [`LSQ_W:0]               cfg_stq_entries,
+    input  wire [`MSHR_W:0]               cfg_mshr_entries,
     input  wire [2:0]               cfg_fetch_width,
     input  wire [2:0]               cfg_issue_width,
     input  wire [2:0]               cfg_commit_width,

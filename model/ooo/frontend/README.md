@@ -18,7 +18,7 @@
 
 | top | cells | memories | latch | state bits |
 |---|---|---|---|---|
-| `fe_front`  | 484  | **0** | 無 | 666（dq 512 + 控制 10 + counter 144）|
+| `fe_front`  | 480  | **0** | 無 | 666（dq 512 + 控制 10 + counter 144）|
 | `rn_rename` | 4789 | **0** | 無 | 608 宣告 / 594 實際（x0 的 RAT entry 與 phys0 的 freelist 位元是常數，被折掉）|
 
 `RUOP` v3（32 → 40 bit）對 cell 數**零影響**（4761 → 4761，只多 32 條 wire bit）：
@@ -81,10 +81,10 @@ scratch 路徑：`/tmp/agentd_prf/`（監督者分配）。
 
 | config | lint fe / rn | fe cells / flops | rn cells / flops | rn flop 預測 | 功能測試 |
 |---|---|---|---|---|---|
-| PRF_N=64  `PRF_W`=6 (RUOP_W 40) | 0 / 0 | 5155 / 666 | 13018 / **594** | 594 | 13/13 PASS |
-| PRF_N=128 `PRF_W`=7 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 20215 / **784** | 784 | 13/13 PASS |
-| PRF_N=192 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 27906 / **974** | 974 | 13/13 PASS |
-| PRF_N=256 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5155 / 666 | 34316 / **1102** | 1102 | 13/13 PASS |
+| PRF_N=64  `PRF_W`=6 (RUOP_W 40) | 0 / 0 | 5151 / 666 | 13018 / **594** | 594 | 13/13 PASS |
+| PRF_N=128 `PRF_W`=7 (RUOP_W 48) | 0 / 0 | 5151 / 666 | 20215 / **784** | 784 | 13/13 PASS |
+| PRF_N=192 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5151 / 666 | 27906 / **974** | 974 | 13/13 PASS |
+| PRF_N=256 `PRF_W`=8 (RUOP_W 48) | 0 / 0 | 5151 / 666 | 34316 / **1102** | 1102 | 13/13 PASS |
 
 cells/flops 是 `proc; opt; check -assert; techmap; opt` 之後的 gate 數與 flop 數
 （techmap 後才數得到 flop 位元數）。四個 config 都是 **latch = 0、memories = 0**。
@@ -150,6 +150,83 @@ wire [`PRF_N-1:0] fl_init = {{(`PRF_N-ARF_N){1'b1}}, {ARF_N{1'b0}}};
 所以「一個 batch 但每個 instance 貴 2.7x」對上「四個 batch 但各自便宜」，
 划不划算取決於 batch 排程器怎麼填。若 sweep 點數會再長（例如同時掃 ROB），
 runtime mask 才明顯占上風。
+
+---
+
+## 1c. CONTRACT v7：尺寸推導與 `cfg_*` 全範圍驗證
+
+### 對 ROB 的依賴：零
+
+`fe_front` 與 `rn_rename` **完全沒有引用 `` `ROB_N `` / `` `ROB_W `` / `robidx`**
+（只有註解提到 ROB）。commit 介面收的是 `cmt_valid/cmt_dv/cmt_arf/cmt_prf`，
+不含 ROB index。所以 ROB 64 → 128 對本目錄沒有影響，四個 PRF config 都在
+`ROB_N=128 / ROB_W=7` 下重跑過。
+
+### 佔用計數器：本模組也有一個，已改成推導
+
+`be_rob` 的 `rob_cnt` 那一類錯誤（計數器裝不下 MAX 本身）在 `fe_front` 也有對應物：
+decode queue 的佔用計數 `dq_cnt_q`。它原本寫死 `[4:0]` / `5'd16`，
+**對 DQ_N=16 完全正確**，但改深度就會安靜地溢位。已全部改成推導：
+
+```verilog
+localparam DQ_CW = $clog2(DQ_N) + 1;      // 16 -> 5 bit（要裝得下 16 本身，不是 4 bit）
+localparam [DQ_CW-1:0] DQ_NC = DQ_N;
+localparam TCW   = $clog2(`W) + 1;        // take/present 計數寬度
+```
+
+同時把 `de_valid` 的 thermometer 從寫死的 `4'b0000 / 4'b0001 / ...`
+改成從 `` `W `` 推導的 generate（寫死的 4-bit 常數在 `` `W `` 變大時會被**靜默零擴展**）。
+
+### 手動展開的 lane 邏輯：加了編譯期斷言
+
+兩個模組的 lane 邏輯（`n_avail` / `n_blk` / 填入 mux / bundle 內旁路鏈）是對
+`` `W ``=4 手寫展開的。現在加了 elaboration 斷言，`` `W `` 一變就**編譯失敗**，
+不會安靜算錯：
+
+```verilog
+generate
+if (`W != 4) begin : g_assert_W
+    ERROR_fe_front_requires_W_eq_4 bad_W();   // 找不到這個模組 -> hierarchy -check 報錯
+end
+endgenerate
+```
+
+### `cfg_fetch_width` 全範圍驗證（§10 新規則）
+
+本目錄只有一個 `cfg_*`：`cfg_fetch_width`（1..4）。T15 在
+**最小值 1 / 中間值 2、3 / MAX 4** 四個點各量 20 拍的交付 uop 數：
+
+| `cfg_fetch_width` | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| 20 拍交付的 uop 數 | 20 | 40 | 60 | 80 |
+
+斷言：非遞減（`thr[4] >= thr[3] >= thr[2] >= thr[1]`）、最小值要能前進、
+MAX 要真的比最小值快。前段沒有 retire，用「送進 rename 的 uop 數」當 IPC 的代理。
+四個 PRF config 下都是同樣的 20/40/60/80。
+
+### PRF 的「容量」驗證（不只是寬度）
+
+T11 是這條規則要的形式 —— 它驗的是**能真的配出多少個實體暫存器**，
+而不是欄位有幾個 bit：
+
+| PRF_N | 64 | 128 | 192 | 256 |
+|---|---|---|---|---|
+| flush 後可配出的實體暫存器數 | 32 | 96 | 160 | 224 |
+| 期望（`PRF_N - 32`）| 32 | 96 | 160 | 224 |
+
+如果哪一級把 `PRF_W` 靜默截斷，或 `fl_init` 回到 `PRF_N/2`，這個數字會立刻不對
+（而 lint 與 yosys 都不會有任何聲音）。
+
+### 最終數字（ROB_N=128 / ROB_W=7）
+
+| config | fe gates / flops | rn gates / flops | rn flop 預測 `62W+2N+94` |
+|---|---|---|---|
+| PRF_N=64 W=6 | 5151 / 666 | 13018 / 594 | 594 MATCH |
+| PRF_N=256 W=8 | 5151 / 666 | 34316 / 1102 | 1102 MATCH |
+
+`fe_front` 的 666 = decode queue 16x32 + 控制 10（`dq_cnt_q` 5 + bub 2 + blk_seen 1
++ shadow 1 + refill 1）+ 三個 48-bit counter，**與 PRF/ROB 尺寸無關**，
+兩個 config 逐位相同。
 
 ---
 

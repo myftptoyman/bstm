@@ -91,19 +91,34 @@ issue 出去時把該欄清掉（`e_age[i] <= e_age[i] & ~sel_m`），
 
 ## 3. `be_eu`
 
-### 3.1 completion wheel（只有倒數，沒有運算）
+### 3.1 in-flight pool：用 robidx 當 slot（v4，原本是 completion wheel）
 
-每個 issue lane 一組 16 槽的環形表（16 = 2^`LAT_W`），`wh_ptr` 每拍 +1。
-issue 一條 lat=L 的 uop 就把它放進 slot `wh_ptr + L - 1`，
-等指標轉到那一格時 pop 出來登記 writeback（下一拍 `wb_valid` 拉起）。
-**沒有任何 ALU / 資料路徑**，整個 EU 就是指標 + 佔用位元（PLAN §5.4）。
+每條 issue 出去的 uop **直接拿自己的 `robidx` 當 slot 編號**：
 
-* lat<=1 的 uop 不進輪子，直接在 issue 當拍登記 writeback。
-* 目標槽被同 lane 先前的 uop 佔住時，往後找第一個空槽（bounded 的結構冒險模型），
-  找不到不會丟掉；16 槽對單 lane 必定有空位。
-* 每個 lane 每拍最多完成 1 條 → 剛好對上 4 條 writeback port。
-  這等同「4 個 write port 靜態切給 4 個 issue lane」，比真實硬體略嚴格，
-  在同 lane 完成撞車時會讓延遲多 1 拍以上。
+```
+slot[robidx] = { v, wt(等 LSU), dv, cnt(`LAT_W), prf(`PRF_W) }
+pool 大小 = `ROB_N（由巨集推導，ROB 加大自動跟上）
+```
+
+ROB entry 在 commit 之前不會被重新配置、每條 uop 只會被 issue 一次，
+所以「兩條 in-flight uop 撞同一個 slot」**在結構上不可能發生**：
+不需要配置邏輯、不需要空槽搜尋，**也不可能溢位丟件**。
+
+* `cnt` 倒數到 0 = 可寫回；搶不到 writeback port 就停在 0 等下一拍，
+  不會被丟掉、也不需要重新排程。
+* `lat<=1` 的 uop 與**本拍回來的 `lsu_done`** 走 bypass 直接參加本拍競爭，
+  所以 lat=1 的相依者下一拍就能 issue（back-to-back 與 v3 完全一致）。
+* writeback port 用**旋轉優先權**挑最多 W 條，不會餓死。
+* `cnt` 設定值：`lat>=2 -> lat-2`，`lat<=1 -> 0`（配合 bypass，
+  使「issue 於 T、writeback 於 T+lat」與舊版逐拍相同）。
+
+**為什麼要換掉 completion wheel**：舊版是 4 lane × 16 槽的環形輪，
+容量固定 64。`lsu_done` 會搶走該 lane 的 writeback port，輸掉的輪子項目
+要「重新排程」到後面的空槽 —— 殘留時間因此會超過 uop 本身的延遲。
+ROB mask 開到 96/128 之後 in-flight 數變多、`lsu_done` 競爭變密，
+lane 的 16 槽會被塞滿，`find_free` 找不到空槽就**把 uop 丟掉**，
+那條 uop 永遠不會 writeback → ROB head 永久卡死 → commit 停擺。
+詳見 §8。
 
 ### 3.2 `prf_ready` scoreboard（clear / set 優先序）
 
@@ -124,14 +139,18 @@ prf_ready <= (prf_ready | set) & ~clear      // ***clear 優先***
 
 ### 3.3 記憶體 uop
 
-`UC_LOAD` / `UC_STORE` / `UC_AMO` 不在 EU 完成：進一條 16 深的 request queue，
-每拍在 `lsu_ready` 時最多送 4 條 `lsu_req_*`（issue 到送出有 1 拍延遲），
-回來的 `lsu_done_*` 直接轉成 writeback。
-`lsu_done_*` 沒有帶 dv 位元，所以 EU 用一條 64 bit 的 `mem_dv`（以 robidx 索引）
-記住每條 mem uop 有沒有 dst，避免 store 回來時亂 set `prf_ready`。
+`UC_LOAD` / `UC_STORE` / `UC_AMO` 不在 EU 完成：slot 標成 `wt`（等 LSU），
+同時在 `rq_pend[robidx]` 記一筆待送的請求。每拍在 `lsu_ready` 時
+用同一套旋轉優先權挑最多 W 條送 `lsu_req_*`（issue 到送出 1 拍延遲）。
+`rq_pend` 一樣由 robidx 定址，所以**請求也不可能被丟掉**
+（v3 用的是 16 深的 FIFO，滿了會丟）。
 
-writeback 埠仲裁優先序：`lsu_done` > 輪子 pop > 本拍 lat<=1。
-`lsu_done` 是輸入、留不住，所以必須最高；輸掉的另外兩者會被排回輪子（不會遺失）。
+`lsu_done_*` 回來時清掉該 slot 的 `wt`，之後就跟一般 uop 一樣排隊寫回。
+**不再需要 `mem_dv` 表、也不用 `lsu_done_prf`** —— EU 在 issue 當拍就把
+dst 存進自己的 slot 了，用自己的比相信 LSU 回填的更穩。
+
+因為 `lsu_done` 只是「把 slot 標成可寫回」而不是直接搶 writeback port，
+v3 那個「輸掉的項目要重新排程」的路徑整條消失了。
 
 ## 4. `be_rob`
 
@@ -226,16 +245,20 @@ yosys 只有 4 則 "Replacing memory \e_xxx with list of registers"（`be_iq`）
 2. **speculative wakeup / replay 沒做**（見 3.2），load 相依者一律等 `lsu_done`。
 3. **`UC_SERIALIZE` / `UC_FENCE` / `UC_CSR` 沒有特別處理**，一律當成一般延遲 uop。
    `RUOP_SERIALIZE`、`RUOP_MEMSTORE` 兩個欄位後段目前沒用到。
-4. **EU 每 lane 每拍最多完成 1 條**（見 3.1），同 lane 撞車會讓延遲變長。
-5. **mem request queue 16 深，滿了會丟請求**：`lsu_ready` 長時間拉低才可能發生
-   （dispatch 端有 `lsq_full` 擋著，在 LDQ+STQ=32 的配置下極難觸發）。
-   一旦丟掉，那條 uop 的 ROB entry 永遠不會 done → 卡死。
-   要根治同樣需要 EU -> IQ 的 backpressure 埠（目前沒有）。
+4. ~~EU 每 lane 每拍最多完成 1 條~~ —— v4 改成 pool + 旋轉優先權後，
+   writeback port 由全部 in-flight uop 共用，沒有 per-lane 限制了。
+5. ~~mem request queue 16 深，滿了會丟請求~~ —— v4 改成 `rq_pend[robidx]` 位元，
+   結構上不可能溢位（見 3.3）。**v3 的這兩條「極難觸發」在 ROB 開到 96 之後
+   都變成必然觸發**，教訓寫在 §8。
 6. **flush 後 `prf_ready` 全設 1**。管線整個清空，沒有 in-flight 的 producer，
    這是最簡單且不會卡死的選擇；rename 端重建 RAT 後配出來的 phys reg
    會由 IQ 的 `wait_m` 重新擋住，語意仍然正確。
 7. ~~`be_eu` 的 `$shift`/`$shiftx`~~ —— v3 已全部改成常數索引展開，四個模組皆為 0。
 8. `be_rob` 的 `rob_full` 用本拍開始時的佔用判斷，ROB 剛好卡在滿的邊緣時會多 stall 1 拍。
+9. **`cfg_*` 的有效下限是 `W` 不是 1**：ready 是 all-or-nothing（ifc v2），
+   dispatch 要有 W 個空位才送得出去，所以 `cfg_rob_entries < W`（同理 `cfg_iq_entries < W`）
+   會直接停擺。實測 `cfg_rob_entries` = 2/3 → retire 0，= 4 → 正常。
+   CONTRACT §3 寫的是 `1..64`，**實際可用範圍是 `W..ROB_N`**，建議更正契約或改成支援 partial dispatch。
 
 ## 7. PRF sweep（`PRF_W` = 6 / 7 / 8 → `PRF_N` = 64 / 128 / 256）
 
@@ -345,3 +368,131 @@ raw stat 兩段各 `$_SDFFE_PP0P_ 102`，`gate_count.sh` 報 204。
 
 一行修法：把 `yosys ... | grep` 之間加一段只取最後一個區塊，例如
 `| tail -60 | awk '/^=== /{f=1} f'`。
+
+---
+
+## 8. ROB sweep（`ROB_N` = 64 / 128）與那個「容量不足」的 bug
+
+### 8.1 症狀與定位
+
+同一個 binary（`ROB_N`=128 `PRF_N`=192），只改 runtime mask：
+
+| mask | IPC（修前） | ROB stall | 平均佔用 |
+|---|---|---|---|
+| 64 | 1.391 | 40,445 | 34.14 / 64 |
+| 96 | **0.072** | 455,420 | 88.36 / 96 |
+| 128 | **0.072** | 455,431 | 118.43 / 128 |
+
+「佔用貼著上限 + retire 幾乎停擺」= commit 沒發生 = **ROB head 的那條 uop 永遠沒 writeback**。
+
+我在 `be_eu` 的兩條掉件路徑上各加一個臨時計數器（debug 複本，不在交付物裡）跑同一條 trace：
+
+```
+mask= 64 → drop_wheel 0   drop_mq 0
+mask= 96 → drop_wheel 4   drop_mq 0     ← 元兇
+mask=128 → drop_wheel 5   drop_mq 0
+```
+
+**500,000 拍裡只要掉 4 件，IPC 就從 1.391 崩到 0.072** —— 因為每掉一件就是一個
+永久卡住的 head，只有等 wrong-path flush 把整個 ROB 清掉才會恢復。
+
+### 8.2 根因
+
+v3 的 completion wheel 是 4 lane × 16 槽、**容量固定 64**，而且
+`lsu_done` 會搶走該 lane 的 writeback port，輸掉的項目要重新排程到後面的空槽
+—— 殘留時間因此會超過 uop 自己的延遲。ROB mask 開大之後 in-flight 變多、
+`lsu_done` 競爭變密，lane 的 16 槽塞滿，`find_free` 找不到空槽就**靜默丟棄**。
+
+這是**容量不足**不是寬度不符：
+
+* `lint` 抓不到（寬度全對）
+* `yosys` 抓不到（合成完全正常）
+* **mask 只開到 64 時 100% 正常**，所有既有測試全過
+
+### 8.3 修法：結構上不可能溢位
+
+改成 **robidx 定址的 in-flight pool**（§3.1）。核心不變式：
+
+> ROB entry 在 commit 前不會被重新配置，每條 uop 只會被 issue 一次
+> → 每條 in-flight uop 都有一個**專屬**的 slot，且 in-flight 數 ≤ `ROB_N`
+> → 不需要配置邏輯、不需要空槽搜尋、**沒有任何路徑會丟件**。
+
+`rq_pend[robidx]` 同理取代了 16 深的 mem request FIFO。
+
+修後（同一條 CoreMark trace，500k 拍）：
+
+| mask | IPC | ROB stall | IQ stall | LSQ stall | 平均佔用 |
+|---|---|---|---|---|---|
+| 64 | **1.439** | 5,769 | 91,079 | 131,302 | 28.71 |
+| 96 | **1.443** | 982 | 91,767 | 133,911 | 29.27 |
+| 128 | **1.443** | 12 | 91,917 | 134,580 | 29.16 |
+
+IPC 隨 mask 單調不減 ✓，ROB stall 單調下降 ✓。
+**注意 mask=64 也從 1.391 變成 1.439（+3.5%）** —— 舊設計就算沒掉件，
+那條「重新排程」路徑本來就在偷偷吃效能。
+
+### 8.4 回歸測試（`backend/run_regress.sh`）
+
+```
+backend/run_regress.sh [tree]     # tree 預設 = model/ooo
+```
+
+`backend/tb_be_regress.sv` 把四個後段模組接起來（配假 rename / 假 LSU），
+在 **`cfg_rob_entries` = W(最小) / `ROB_N`/2 / `ROB_N`(MAX)** 三點 × 10 種 workload 上驗證：
+
+1. 每個 mask 都要有 commit（`retired > 0`）→ 抓「head 永久卡住」
+2. **`retired` 不得因 mask 變大而劣化**（容 5% 雜訊）→ 抓容量不足造成的掉件
+3. `cmt_arf` 逐條比對（`arf_bad == 0`）
+
+其中 **mode 9 是專門為這個 bug 設計的**：獨立長延遲 ALU + 大量 load，
+同時填滿 EU 並製造 `lsu_done` 競爭。實測它確實抓得到：
+
+```
+舊 be_eu @ ROB_N=128:  mode=9  mask=4:108  mask=64:896  mask=128:64   → FAIL（變大反而劣化）
+新 be_eu @ ROB_N=128:  mode=9  mask=4:108  mask=64:1720 mask=128:1928 → PASS
+```
+
+一般的 workload（mode 0~8）**抓不到**這個 bug：mode 7（獨立 lat=15）雖然能把
+in-flight 堆到 64，但沒有 `lsu_done` 競爭就不會觸發重新排程。
+**「填滿容量」和「填滿容量且有競爭」是兩件事**，回歸測試要涵蓋後者。
+
+### 8.5 成本（`gates / state_bits`，量法同 §7.3）
+
+`be_eu` v4 的狀態公式：
+
+```
+be_eu = `ROB_N*(4 + `LAT_W + `PRF_W)   ← pool：v + wt + dv + rq_pend + cnt + prf
+      + 2*`ROB_W                        ← 兩個旋轉優先權基準
+      + `PRF_N                           ← prf_ready scoreboard
+      + 2*`W + `W*`PRF_W + 2*`W*`ROB_W   ← wb / lsu_req 輸出暫存
+```
+
+@ROB 64 / PRF 64：`64*14 + 12 + 64 + 8 + 24 + 48 = 1,052` ✓ 與實測逐位相同。
+
+| 模組 | v3（wheel） | v4（pool） | 變化 |
+|---|---|---|---|
+| `be_eu` | 13,944 / 1,217 | **26,296 / 1,052** | gates +89%，**狀態 −14%** |
+| 後段合計 | 116,718 / 7,172 | **129,070 / 7,007** | gates +10.6%，**狀態 −165 bit** |
+
+兩種 `ROB_N` 建置的完整數字（`gates / state_bits`）：
+
+| 模組 | ROB 64 / PRF 64 | ROB 128 / PRF 192 | 狀態公式 |
+|---|---|---|---|
+| `be_dispatch` | 451 / 102 | 488 / 103 | `` `ROB_W + 2*48 `` |
+| `be_iq` | 81,854 / 4,688 | 147,626 / 9,200 | `` IQ_N*(1+RUOP_W+ROB_W+PRF_N) + IQ_N² + PRF_N + 48 `` |
+| `be_eu` | 26,296 / 1,052 | 58,904 / 2,350 | 見上方公式 |
+| `be_rob` | 20,469 / 1,165 | 44,888 / 2,383 | `` ROB_N*(4+5+PRF_W) + 2*ROB_W+1 + 4*48 `` |
+
+**8 個實測狀態值與公式逐一吻合**（例如 `be_rob` @ROB128/PRF192
+= `128*(4+5+8) + 15 + 192 = 2,383`）—— 這是「ROB 寬度真的打通、
+沒有被靜默截斷」的證據。
+
+換句話說：**修掉這個 bug 不但沒有讓 bit-sliced 工作集變大，還小了一點**
+（pool 拿掉了 wheel 的 `rob` 欄位、`mem_dv` 表與 mem FIFO），
+代價是 gate 數 +10.5%（多出來的是 `ROB_N` 寬的優先權挑選與讀出 mux）。
+
+### 8.6 教訓
+
+runtime mask 會給一種假的安全感：**結構建到 128、mask 只開 64，
+所有測試都會過，而 64 以上的路徑從來沒被走過。**
+這次之後我的回歸測試一律掃 `cfg_*` 的 最小 / 中間 / MAX 三點。

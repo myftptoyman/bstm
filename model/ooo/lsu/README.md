@@ -162,42 +162,147 @@ miss），只佔一個 entry。demo 沒有位址，無從判斷是否同 line，
 
 ---
 
-## 5b. 寬度參數化（PRF / ROB sweep）
+## 5b. 尺寸參數化（CONTRACT v7 §0：禁止寫死數字）
 
-本模組**沒有任何硬編的 PRF / ROB 寬度**。所有帶實體暫存器或 ROB index 的欄位
-都走 `` `PRF_W `` / `` `ROB_W ``：
+本模組**沒有任何硬編的尺寸**。所有宣告都從 `` `XXX_N `` / `` `XXX_W `` 推導：
 
-| 走 `` `ROB_W `` | 走 `` `PRF_W `` |
+| 來源 | 用在哪 |
 |---|---|
-| `ld_rob` `st_rob` `ms_rob` `hl_rob` `pq_rob` `d_rob` `sr0/1` `g_rob0/1` `c_rob` | `ld_prf` `st_prf` `ms_prf` `hl_prf` `d_prf` `g_prf0/1` `c_prf` |
+| `` `ROB_W `` | `ld_rob` `st_rob` `ms_rob` `hl_rob` `pq_rob` `d_rob` `sr0/1` `g_rob0/1` `c_rob` 及所有切片 |
+| `` `PRF_W `` | `ld_prf` `st_prf` `ms_prf` `hl_prf` `d_prf` `g_prf0/1` `c_prf` |
+| `` `LDQ_N `` `` `STQ_N `` | `LDN` `STN`、所有佇列陣列 |
+| `` `LSQ_W `` | index（`ld_head/tail` `ld_wid` `ms_ldq` `hl_idx` `dh` `a_ldt` `c_idx` …）|
+| `` `LSQ_W + 1 `` | **佔用計數**（`ld_cnt` `st_cnt` `a_ldc` `a_stc` `tmp5`）—— 要裝得下 MAX 本身 |
+| `` `MSHR_N `` / `` `MSHR_W `` | `MSN` / `ms_sel` 與 MSHR index 比對 |
+| `$clog2(...)` | 本模組自有結構（延遲線 `HD/HDW/HS/HSW`、請求緩衝 `PQN/PQW/PQCW`、mem-event FIFO `MQN/MQW/MQCW`）|
 
-注意 `ld_rob`/`ld_prf`（及 st/ms/hl 的對應項）**必須分開宣告** —— 它們原本共用
-一個 `[N*6-1:0]`，PRF 與 ROB 寬度分家之後合併宣告就錯了。
+零擴展與常數也都推導：`{{(LQCW-2){1'b0}}, ndl_ld}`、`{{(LQCW-LQW){1'b0}}, dh}`、
+`TGT_MAX = {HDW{1'b1}}`、`LQ_MINV`、`MQ_MAXV`…；所有遞增改成 `+ 1'b1`（寬度無關）。
 
-**不隨 PRF/ROB 變動的 6：** mem-event FIFO 的 payload 是
-`MEV_W = 6`（`{lat_class(4), level(2)}`），以及 `me_cnt`（MQN=32 的佔用計數）。
-已經具名成 `MEV_W` 並加註解，避免下次 sweep 被誤改。
+`ld_rob`/`ld_prf`（及 st/ms/hl 的對應項）**必須分開宣告** —— 它們原本共用一個
+`[N*6-1:0]`，ROB 與 PRF 寬度分家之後合併宣告就是錯的。
 
-**LSQ index 欄位**（`ld_wid` `ms_ldq` `hl_idx`，各 4 bit）綁的是
-`LDN`/`STN` = 16（CONTRACT §0 的 MAX 表固定），不是 PRF/ROB，不需要跟著掃。
+**不隨尺寸變動的常數：** mem-event payload `MEV_W = 6`（`{lat_class(4), level(2)}`，
+由 `include/bstf.h` 的 `MEM_*` 定義），以及 `lat_lut` 的 4-bit class。已經具名並加註解。
 
-### 驗證結果
+### 驗證矩陣（`test/run_tests.sh`，5 組尺寸）
 
-`` `PRF_W `` = 6 / 7 / 8（`PRF_N` = 64 / 128 / 256，`RUOP_W` = 40 / 48 / 48，
-`RUOP_D` / `RUOP_S1` / `RUOP_S2` 隨 `PRF_W` 加寬）三種都：
+| 變體 | ROB | PRF | LSQ | lint | yosys | 功能 | cells | flop bits |
+|---|---|---|---|---|---|---|---:|---:|
+| v7-base | 64/6 | 64/6 | 16/4 | 0 warn | 0 prob | PASS | 12,743 | 1,556 |
+| rob128 | **128/7** | 64/6 | 16/4 | 0 warn | 0 prob | PASS | 12,748 | 1,620 |
+| prf256 | 64/6 | **256/8** | 16/4 | 0 warn | 0 prob | PASS | 12,748 | 1,668 |
+| rob128-prf256 | **128/7** | **256/8** | 16/4 | 0 warn | 0 prob | PASS | 12,748 | 1,732 |
+| lsq8 | 128/7 | 256/8 | **8/3** | 0 warn | 0 prob | PASS | 8,860 | 1,294 |
 
-| `PRF_W` | verilator `-Wall` | yosys `check -assert` | cells | flop bits |
-|---|---|---|---:|---:|
-| 6 | 0 warning 0 error | 0 problems | 12,743 | 1,556 |
-| 7 | 0 warning 0 error | 0 problems | 12,748 | 1,612 |
-| 8 | 0 warning 0 error | 0 problems | 12,748 | 1,668 |
+### flop 數推導對照（逐項對得上，代表寬度真的打通、沒被靜默截斷）
 
-flop 增量 = **每 PRF bit +56**（LDQ 16 + STQ 16 + MSHR 8 + 延遲線 16 = 56 個
-`prf` 欄位），跟解析預期完全吻合 —— 代表寬度真的打通了，沒有被靜默截斷。
+**每增加 1 個 `` `ROB_W `` bit：+64 flop**
+= LDQ 16 + STQ 16 + MSHR 8 + 延遲線 16 + 請求緩衝 8 = **64** 個 `rob` 欄位。
+（`d_rob` 是組合輸出，不算 flop。）實測 1,620 − 1,556 = **64** ✓
 
-**成本結論：PRF sweep 對本模組幾乎是免費的**（64→256 只多 112 個 flop、
-gate 數在雜訊內）。PRF 大小在 `lsu_q` 已經不是結構性維度，
-可以跟別的配置塞進同一個 bit-slice batch。
+**每增加 1 個 `` `PRF_W `` bit：+56 flop**
+= LDQ 16 + STQ 16 + MSHR 8 + 延遲線 16 = **56** 個 `prf` 欄位。
+（請求緩衝只存 rob。）實測 (1,668 − 1,556)/2 = **56** ✓
+
+**兩者可加：** 1,556 + 64 + 112 = **1,732** ✓（與 rob128-prf256 實測完全相同）
+
+**LSQ 16/4 → 8/3：−438 flop**
+
+| 項目 | 16/4 | 8/3 | Δ |
+|---|---:|---:|---:|
+| LDQ entry = v,ar,st,blk,dn(5)+rob(7)+prf(8)+lvl(2)+lc(4)+wid(LSQ_W) | 16×30=480 | 8×29=232 | −248 |
+| STQ entry = v,ar,st,dn,noacc(5)+rob(7)+prf(8) | 16×20=320 | 8×20=160 | −160 |
+| `ms_ldq` (MSHR_N × LSQ_W) | 32 | 24 | −8 |
+| `hl_idx` (HS × LSQ_W) | 64 | 48 | −16 |
+| `ld/st_head`,`ld/st_tail` (4 × LSQ_W) | 16 | 12 | −4 |
+| `ld_cnt`,`st_cnt` (2 × (LSQ_W+1)) | 10 | 8 | −2 |
+| | | | **−438** |
+
+實測 1,732 − 1,294 = **438** ✓
+
+**成本結論：ROB / PRF sweep 對本模組幾乎免費**（每 bit 64 / 56 個 flop，
+gate 數在雜訊內：12,743 → 12,748）。兩者在 `lsu_q` 都不是結構性維度。
+
+---
+
+## 5c. `cfg_*` 的可表示下限（契約層面的觀察，請監督者裁決）
+
+CONTRACT §3 寫 `cfg_ldq_entries` 範圍是 ``1..`LDQ_N``，但 CONTRACT v2 同時裁決
+**所有 `*_ready` 是 all-or-nothing、不支援 partial accept**。這兩條有衝突：
+
+一組 dispatch 最多有 `` `W `` 條記憶體 uop，而 `be_dispatch` 要嘛整組收、要嘛整組不收。
+所以只要 `cfg_ldq_entries < ` `` `W ``，`lsq_full` 就永遠拉高 → 模型不前進。
+**小於 `` `W `` 的 LSQ 在這個協定下無法表示。**
+
+本模組的處理：把 `ld_max` / `st_max` 夾在 `` [`W, `LDQ_N] `` —— 夾住而不是掛掉，
+這樣 CONTRACT v7 §10.1 要求的「cfg 掃到最小值」不會讓模型停住（實測 cfg=1 與 cfg=4
+行為相同、都正常前進）。
+
+**建議二選一：**
+1. §3 把 LDQ/STQ 的範圍改成 ``\`W..`LDQ_N``，或
+2. `lsq_full` 改成能表達 partial accept（要動 `be_dispatch` 與 ready 語意）
+
+---
+
+## 5d. 跨模組不變量：mem-event side FIFO 不得溢位【重要】
+
+side FIFO 深度 `MQN = 32`。**在 `fb_take` 與 `ds_valid` 之間同時在飛的記憶體 uop
+數量必須 < 32**，否則 push 會被丟掉，之後每一次 pop 都錯位 —— 後續所有 load
+都拿到別人的 cache 事件。**這是資料錯誤，不是效能誤差。**
+
+目前的邊界：`fe_front` 的 `DQ_N = 16` + rename/dispatch 各 `` `W `` 條 ≈ 24 < 32，
+有 8 條的餘裕。**但如果 Agent D 加深 decode queue，這個不變量會靜默失效。**
+
+這正是 CONTRACT v7 §10 講的那類「容量不足、lint 抓不到」的錯誤，所以我為它寫了
+**專門的偵測與負測**（見 §8 的 T2 / T6）：
+- T2 斷言「每個記憶體 uop 的實測延遲 >= 它的 base latency」。錯位會讓一條 DRAM
+  load（90 拍）拿到 L1-hit 事件（3 拍）而提早完成 → 立刻被抓到
+- T6 是負測：刻意把 fetch→dispatch 距離拉到 12 級（遠超 32），斷言 T2 **必須**報錯
+  （實測 latviol = 222~235）。這保證 T2 不是一個永遠成立的空檢查
+
+**根本解**仍然是先前提過的：把 6-bit mem event 塞進 `DUOP` 的保留欄位讓它跟著 uop
+走過 decode queue，side FIFO 就整個消失（同時省掉約 6,000 gate，見 §7）。
+那需要改 `ifc.vh` + Agent D，是監督者的決定。
+
+---
+
+## 8. 自測（`test/`）
+
+```bash
+model/ooo/lsu/test/run_tests.sh [scratch_dir]     # 預設 /tmp/agentf_lsu_test
+```
+
+對 §5b 表格裡的 5 組尺寸，各跑 **lint + yosys + 功能測試**。
+`test/gen_layout.py` 從 `common/ifc.vh` 抽欄位佈局產生 `layout.h`，
+所以 bit 佈局的唯一真相留在 `ifc.vh`，測試不自己複製一份。
+
+| 測項 | 內容 |
+|---|---|
+| T1 | 每個記憶體 uop 恰好收到一次 `done`、不卡死（含 AMO 只回報一次） |
+| T2 | **mem-event 對齊**：實測延遲不得低於該 uop 的 base latency |
+| T3 | **MSHR 是 MLP 上限**：全 DRAM 時 miss 吞吐 <= `min(MSHR_N, LDQ_N) / latency` |
+| T4 | `cnt_st_mshr` 語意：全 L1 hit 時為 0；全 DRAM 且 `LDQ_N > MSHR_N` 時 > 0 |
+| T5 | `cfg_ldq/stq` 在 **最小 / 中間 / MAX** 三點都要前進，且吞吐不隨 mask 變大而劣化 |
+| T6 | **負測**：刻意讓 side FIFO 溢位，斷言 T2 必須報錯（證明 T2 有牙齒）|
+
+實測（v7-base）：
+
+```
+cfg=1    cycles=8583  done=2912  thr=0.339/cyc  st_mshr=0     latviol=0
+cfg=8    cycles=3339  done=2912  thr=0.872/cyc  st_mshr=0     latviol=0
+cfg=16   cycles=3224  done=2912  thr=0.903/cyc  st_mshr=0     latviol=0
+all-DRAM cycles=6692  miss=565   miss_thr=0.0844/cyc  ceiling=0.0889  st_mshr=5581
+negative(deep fetch pipe) latviol=235   <- T6 期望 > 0
+```
+
+兩個值得記錄的觀察：
+
+1. **T3 是本模組存在意義的直接量測**。全 DRAM 時 miss 吞吐 0.0844/cyc，
+   緊貼 8 MSHR / 90 拍 = 0.0889 的理論上限 —— MSHR 確實在當 MLP 的閘門。
+2. **`LDQ_N = 8` 時 `cnt_st_mshr` 變成 0**，因為 LDQ 先滿，MSHR 永遠吃不滿。
+   也就是說 **MLP 的瓶頸是 `min(MSHR_N, LDQ_N)`**，掃 MSHR 數量時若不同時放大
+   LDQ，會量到一條假的平坦曲線。做 MSHR sweep 的人要注意這點。
 
 ## 6. `cfg_mshr_entries` 未接線
 

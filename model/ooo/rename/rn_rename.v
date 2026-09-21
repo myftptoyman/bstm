@@ -408,4 +408,14 @@ end
 assign cnt_st_rename       = c_rn_q;
 assign cnt_st_backpressure = c_bp_q;
 
+// ---------------- 編譯期斷言（CONTRACT v7 §10）----------------
+// 本模組的 lane 邏輯是對 `W = 4 手動展開的（d0..d3 的 bundle 內旁路鏈）。
+// 若 `W 改變，這裡會在 elaboration 就因為找不到模組而報錯，
+// 而不是讓寬度不符被零擴展、安靜地算出錯的結果。
+generate
+if (`W != 4) begin : g_assert_W
+    ERROR_rn_rename_requires_W_eq_4 bad_W();
+end
+endgenerate
+
 endmodule

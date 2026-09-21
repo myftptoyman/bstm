@@ -22,7 +22,7 @@
 /* verilator lint_off MULTITOP */   // 四個模組一起 lint 時本來就沒有唯一 top
 module be_iq (
     input  wire clk, input wire rst, input wire flush,
-    input  wire [5:0]            cfg_iq_entries,
+    input  wire [`IQ_W:0]            cfg_iq_entries,
     input  wire [2:0]            cfg_issue_width,
     input  wire [`W-1:0]         ds_valid,
     input  wire [`W*`RUOP_W-1:0] ds_ruop,

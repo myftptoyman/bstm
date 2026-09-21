@@ -14,14 +14,18 @@ fetch   decode rename dispatch | issue exec writeback commit
 ```
 
 最大尺寸（runtime mask 可縮小，見 §3）:
-| 結構 | MAX | 索引寬度 |
-|---|---|---|
-| ROB | 64 | 6 bit |
-| IQ | 32 | 5 bit |
-| LDQ / STQ | 16 / 16 | 4 bit |
-| MSHR | 8 | 3 bit |
-| 實體暫存器 PRF | 64 | 6 bit |
-| fetch / issue / commit width | 4 | 3 bit |
+| 結構 | MAX | 索引寬度 | 備註 |
+|---|---|---|---|
+| ROB | **128** | **7 bit** | v7：64 → 128，可 sweep |
+| IQ | 32 | 5 bit | |
+| LDQ / STQ | 16 / 16 | 4 bit | |
+| MSHR | 8 | 3 bit | |
+| 實體暫存器 PRF | **256** | **8 bit** | v7：64 → 256，可 sweep |
+| fetch / issue / commit width | 4 | 3 bit | |
+
+**所有尺寸相關的宣告一律從 `` `XXX_N `` / `` `XXX_W `` 推導，禁止寫死數字。**
+這包括：陣列寬度、佔用計數器（需 `` `XXX_W+1 `` 位元才裝得下 MAX 本身）、
+零擴展的補零位數、`+ N'd1` 這類常數的寬度、以及 `cfg_*` 埠本身的寬度。
 
 ## 1. 五條建模硬規則（Verilog agent 必須遵守，違反即退回）
 
@@ -54,11 +58,11 @@ fetch   decode rename dispatch | issue exec writeback commit
 ## 3. 每 lane 的配置暫存器（`cfg_*`，模型輸入，測試時固定）
 
 ```
-cfg_rob_entries   [6:0]   1..64
-cfg_iq_entries    [5:0]   1..32
-cfg_ldq_entries   [4:0]   1..16
-cfg_stq_entries   [4:0]   1..16
-cfg_mshr_entries  [3:0]   1..8
+cfg_rob_entries   [`ROB_W:0]    `W..`ROB_N     (v7.1: 下限改 `W，見下)
+cfg_iq_entries    [`IQ_W:0]     `W..`IQ_N
+cfg_ldq_entries   [`LSQ_W:0]    `W..`LDQ_N
+cfg_stq_entries   [`LSQ_W:0]    `W..`STQ_N
+cfg_mshr_entries  [`MSHR_W:0]   1..`MSHR_N     (MSHR 不受 all-or-nothing 影響)
 cfg_fetch_width   [2:0]   1..4
 cfg_issue_width   [2:0]   1..4
 cfg_commit_width  [2:0]   1..4
@@ -188,3 +192,147 @@ ooo_top（38,549 cells）bit-sliced vs Verilator
 
 1. **成本是量化的**：規則 2 的 max-size + mask 讓 `cfg=48` 與 `cfg=64` 成本相同。IQ 只能選 32/64，LDQ/STQ 只能選 16/32。中間值有 IPC 意義、無成本意義。
 2. **`full` 訊號可能是協定假象**：用 Little's Law 反推平均佔用，與 `full` 的觸發率對照。本例 LSQ 平均佔用 25% 卻有 22% 時間報滿 → all-or-nothing 協定造成，加 entry 無效。
+
+
+## v7（2026-09-21 23:50）— ROB 參數化，以及一條新的驗證規則
+
+### 背景：監督者的流程錯誤
+
+PRF sweep 是**正式派任務**給 D/E/F 去參數化的，三方都做到了。
+ROB sweep 監督者**沒有派任務，直接自己改 `ifc.vh` 跑**，然後把「不支援契約沒要求過的尺寸」
+當成 agent 的缺陷回報。這是不公平的，也是錯誤的流程。
+
+`rob_cnt [6:0]` 能表示 0..127，**對 CONTRACT §0 宣告的 ROB MAX = 64 完全正確**。
+
+### §10 新規則（強制）：`cfg_*` 必須在完整範圍上被驗證
+
+「最大尺寸 + runtime mask」這個模式有一個特有的失效模式：
+
+```
+結構建到 MAX=128，但 cfg mask 只開到 64
+  → 所有測試通過
+  → 逐位等同 MAX=64 的建置
+  → 但 64 以上的路徑從來沒被走過
+```
+
+實例：`rob_cnt` 的容量不足在 mask=64 時完全無症狀，mask=96 才讓 commit 停擺（IPC 1.391 → 0.072）。
+**lint 抓不到**（`[6:0]` 賦值給 `[6:0]` 合法），**yosys 抓不到**，**預設配置的測試抓不到**。
+
+所以：
+
+1. 每個 `cfg_*` 至少要在 **最小值 / 中間值 / MAX** 三點上跑過功能測試
+2. 特別注意「容量不足」而非「寬度不符」的錯誤 —— 佔用計數器要能表示 **MAX 本身**（需 `` `W+1 `` 位元）
+3. 回歸測試要斷言 **IPC 或 retire 數不因 mask 增大而劣化**
+
+### §11 驗證工具本身會安靜地騙人
+
+本專案至今有 **5 次**是「驗證工具給出錯誤結果」而非「被驗證的程式碼有錯」：
+
+| # | 工具 | 錯誤 |
+|---|---|---|
+| 1 | `ci/check_contract.sh` | 把 `%Error: Exiting due to N warning(s)` 這行彙總當成實質 error |
+| 2 | 同上 | grep 沒剝註解，agent 把規則抄在註解裡就被判違規 |
+| 3 | 同上 | 加入 `select -assert-none t:$dlatch` 後，**yosys 回顯的指令文字被自己的 grep 抓到**，七個模組全部誤判 FAIL |
+| 4 | `ci/gate_count.sh` | yosys 印兩段 `=== module ===` stat，腳本兩段都加總 → **所有數字 2 倍** |
+| 5 | Agent D 的 sweep 腳本 | `verilator --binary --Mdir obj_N -o sim_N`：**相對路徑的 `-o` 會落在 `--Mdir` 裡面**，執行時跑到更早一輪留下的舊 binary → 整輪測試結果不可信 |
+
+**對策（Agent D 提出，納入契約）：**
+
+> 每個測試結果都必須包含一個**會隨條件改變的指紋數字**。
+> 舊 binary 或錯誤的建置不會印出對應的值，因此一眼可辨。
+
+實例：
+- `T11`：flush 後實際配得出的實體暫存器數 = **32 / 96 / 160 / 224**（隨 `PRF_N` 64/128/192/256）
+- `T15`：交付 uop 數 = **20 / 40 / 60 / 80**（隨 `cfg_fetch_width` 1/2/3/4）
+
+「ALL TESTS PASSED」不算指紋 —— 它在任何 binary 上長得都一樣。
+
+### §12 對手寫展開的固定寬度加 elaboration 斷言
+
+手寫展開 `` `W ``=4 條 lane 的邏輯，若 `` `W `` 改變會**安靜算錯**。用不存在的模組強制編譯失敗：
+
+```verilog
+generate if (`W != 4) begin : g_assert_W
+    ERROR_module_requires_W_eq_4 bad_W();   // 模組不存在 → hierarchy -check 報錯
+end endgenerate
+```
+
+
+## v7.1（2026-09-22）— Agent F 提出的三項裁決
+
+### (1) `cfg_*` 的下限改成 `` `W ``
+
+§6 的 all-or-nothing ready 語意（`ready=0` 時一條都不可送出）與 `cfg < `W` 相衝突：
+一組 dispatch 最多 `` `W `` 條，若有效容量小於 `` `W ``，`*_full` 永遠拉高、模型不前進。
+
+**裁決**：`cfg_rob/iq/ldq/stq_entries` 的合法下限改為 `` `W ``（=4）。
+實作端可夾住（clamp）而非掛掉，使 §10.1 要求的「最小值測試」仍能通過。
+`cfg_mshr_entries` 不受影響（MSHR 不是 dispatch 的 all-or-nothing 資源）。
+
+根本解仍是讓 ready 支援 partial accept —— 那同時會解掉 Little's Law 揭露的
+「LSQ 平均只用 25% 容量卻有 22% 時間報滿」的門檻假象。列為待辦。
+
+### (2) 跨模組容量不變量：mem-event side FIFO
+
+**`lsu_q` 的 mem-event FIFO 深度 `MQN=32`。在 `fb_take` 與 `ds_valid` 之間同時在飛的
+記憶體 uop 數必須 < 32**，否則 push 被丟棄、之後每次 pop 都錯位 →
+**所有 load 拿到別人的 cache 事件。這是資料錯誤不是效能誤差，lint 與 yosys 都抓不到。**
+
+目前邊界：`DQ_N=16` + rename/dispatch ≈ 24 < 32，餘裕 8 條。
+**Agent D 若加深 decode queue 會靜默失效。**
+
+偵測（Agent F 實作）：
+- **T2**：斷言每個 mem uop 的實測延遲 ≥ 它的 base latency（錯位會讓 90 拍的 DRAM load
+  拿到 3 拍的 L1-hit 事件而提早完成）
+- **T6 負測**：刻意把 fetch→dispatch 拉到 12 級，**斷言 T2 必須報錯**（實測 latviol 222~235）
+
+T6 的存在保證 T2 不是永遠成立的空檢查。**任何不變量的檢查都應附一個負測證明它抓得到。**
+
+根本解：把 6-bit mem event 塞進 `DUOP` 的保留欄位讓它跟著 uop 走，side FIFO 整個消失，
+順便省約 6,000 gate。需要 `DUOP_W` 加寬 + Agent D 與 F 同步修改，列為待辦。
+
+### (3) sweep 陷阱：耦合維度會產生假的平坦曲線
+
+`lsq8` 變體（LDQ 8）實測 `cnt_st_mshr = 0` —— 不是 bug，是 **LDQ 先滿，8 個 MSHR 永遠吃不滿**。
+
+> **MLP 的瓶頸是 `min(MSHR_N, LDQ_N)`。掃 MSHR 數量時若不同時放大 LDQ，
+> 會量到一條假的平坦曲線，並得出「加 MSHR 沒用」的錯誤結論。**
+
+這與 §9 的「成本是量化的」是同一類 sweep 方法論陷阱：
+**掃一個維度之前，先確認它不是被另一個維度夾住的。**
+
+實證：全 DRAM 時 miss 吞吐 0.0844/cyc，緊貼 `8 MSHR / 90 拍 = 0.0889` 的理論上限 ——
+MSHR 確實在當 MLP 的閘門，前提是 LDQ 夠大。
+
+
+## v7.2（2026-09-22）— 「填滿容量」不等於「填滿容量且有競爭」
+
+### §13 資源競爭測試
+
+CONTRACT §10 要求「每個 `cfg_*` 在最小/中間/MAX 三點上跑功能測試」。
+**這不夠。** Agent E 找到的 `be_eu` completion wheel 溢位證明了這一點：
+
+```
+mode 7（獨立 lat=15）  能把 in-flight 堆到 64   → 不觸發
+mode 9（長延遲 ALU + 大量 load，製造 lsu_done 競爭）→ 觸發
+```
+
+根因是共享資源（writeback port）的競爭讓項目被迫「重新排程」，殘留時間超過
+uop 本身的延遲，最終塞爆固定容量的結構並**靜默丟棄**。
+
+> **測試必須在目標尺寸下同時製造資源競爭，不能只是把結構填滿。**
+
+### §14 結構性不可能 > 容量足夠
+
+`be_eu` 原本的修法選項是「把 wheel 加大到 ROB_N」。Agent E 改成
+**robidx 定址的 in-flight pool**：每條 issue 出去的 uop 用自己的 `robidx` 當 slot 編號。
+
+不變式：ROB entry 在 commit 前不會重配、每條 uop 只 issue 一次
+→ 每條 in-flight uop 都有專屬 slot
+→ **不需要配置邏輯、不需要空槽搜尋、沒有任何路徑會丟件**
+
+結果：狀態量**變小** 165 bit（wheel 的 `rob` 欄位、`mem_dv` 表、mem FIFO 全部消失），
+gate 只 +10.6%，而且連 ROB=64 的 IPC 都從 1.391 → 1.439（+3.5%）——
+舊的重新排程路徑本來就在偷吃效能。
+
+> **能讓失效在結構上不可能發生時，不要只是把容量加大。**

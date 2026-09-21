@@ -11,7 +11,7 @@
 /* verilator lint_off MULTITOP */   // 四個模組一起 lint 時本來就沒有唯一 top
 module be_dispatch (
     input  wire clk, input wire rst, input wire flush,
-    input  wire [6:0]            cfg_rob_entries,
+    input  wire [`ROB_W:0]            cfg_rob_entries,
     input  wire [`W-1:0]         rn_valid,
     input  wire [`W*`RUOP_W-1:0] rn_ruop,
     output wire                  rn_ready,
@@ -34,7 +34,7 @@ module be_dispatch (
     reg  [`W*`ROB_W-1:0] idx_v;
     reg  [`ROB_W-1:0]    tail_nxt;
     reg  [`ROB_W-1:0]    cur;
-    reg  [6:0]           cur_p1;
+    reg [`ROB_W:0] cur_p1;
     integer              di;
 
     // ---------------- 滿 / stall ----------------
@@ -55,7 +55,7 @@ module be_dispatch (
         idx_v = {(`W*`ROB_W){1'b0}};
         for (di = 0; di < `W; di = di + 1) begin
             idx_v[di*`ROB_W +: `ROB_W] = cur;
-            cur_p1 = {1'b0, cur} + 7'd1;
+            cur_p1 = {1'b0, cur} + {{`ROB_W{1'b0}},1'b1};
             if (rn_valid[di])
                 cur = (cur_p1 >= cfg_rob_entries) ? {`ROB_W{1'b0}} : cur_p1[`ROB_W-1:0];
         end

@@ -28,8 +28,16 @@ module fe_front (
 );
 
 // ---------------- 參數 ----------------
-localparam DQ_N  = 16;           // decode queue 深度
+localparam DQ_N  = 16;           // decode queue 深度（本模組唯一的結構尺寸）
 localparam DQ_W  = `DUOP_W;      // 解碼後 uop 寬度（跟著巨集走）
+// 佔用計數器要裝得下 MAX 本身（CONTRACT v7 §10 第 2 點）：
+// DQ_N=16 需要 5 bit（0..16），不是 $clog2(16)=4 bit。
+localparam DQ_CW = $clog2(DQ_N) + 1;
+localparam [DQ_CW-1:0] DQ_NC = DQ_N;   // 宣告寬度即截斷，不用 part-select
+// 一拍最多搬 `W 條，take/present 的計數寬度也從 `W 推導（fb_take 埠是 [2:0]）
+localparam TCW   = $clog2(`W) + 1;
+localparam [TCW-1:0]   W_T  = `W;
+localparam [DQ_CW-1:0] W_C  = `W;
 // CNT_B「碰巧」是 6，但它是 48-bit counter 的 8-bit 分段數，
 // 與 `PRF_W / `ROB_W 無關，做 PRF/ROB sweep 時不可跟著改。
 localparam CNT_B = 6;
@@ -44,7 +52,7 @@ wire       unused_fe_ev = |{fb_fe_event[6:5], fb_fe_event[3:2]};
 
 // ---------------- 狀態 ----------------
 reg  [DQ_N*DQ_W-1:0] dq_q;        // decode queue（head 固定在 slot 0）
-reg  [4:0]           dq_cnt_q;    // 0..16
+reg  [DQ_CW-1:0]     dq_cnt_q;    // 0..DQ_N（含 DQ_N 本身）
 reg  [1:0]           bub_q;       // 尚未消化的前端泡泡
 reg                  blk_seen_q;  // 目前 head 的 fetch block 事件已取用
 reg                  shadow_q;    // 1 = 目前走 wrong path
@@ -52,16 +60,20 @@ reg                  refill_q;    // 1 = flush 之後還沒成功送出過 uop�
 
 // ================= 輸出側（送往 rename）=================
 // 一次最多呈現 4 條；de_ready = 1 代表「本拍把 de_valid 全收下」（all-or-nothing）
-wire [2:0] n_pres = (dq_cnt_q >= 5'd4) ? 3'd4 : dq_cnt_q[2:0];
+wire [TCW-1:0] n_pres = (dq_cnt_q >= W_C) ? W_T : dq_cnt_q[TCW-1:0];
 
-assign de_valid = (n_pres == 3'd0) ? 4'b0000 :
-                  (n_pres == 3'd1) ? 4'b0001 :
-                  (n_pres == 3'd2) ? 4'b0011 :
-                  (n_pres == 3'd3) ? 4'b0111 : 4'b1111;
+// thermometer：slot i 有效 <=> i < n_pres（寬度跟著 `W 走，不寫死 4'b....）
+genvar gv;
+generate
+for (gv = 0; gv < `W; gv = gv + 1) begin : g_dev
+    localparam [TCW-1:0] GV = gv;
+    assign de_valid[gv] = (GV < n_pres);
+end
+endgenerate
 assign de_duop  = dq_q[`W*DQ_W-1:0];
 
-wire [2:0] n_out = de_ready ? n_pres : 3'd0;         // 本拍出隊數
-wire [4:0] rem   = dq_cnt_q - {2'b00, n_out};        // 出隊後剩餘
+wire [TCW-1:0] n_out = de_ready ? n_pres : {TCW{1'b0}};         // 本拍出隊數
+wire [DQ_CW-1:0] rem = dq_cnt_q - {{(DQ_CW-TCW){1'b0}}, n_out};   // 出隊後剩餘
 
 // ================= 輸入側（從 fetch buffer 取）=================
 // 前端泡泡：新 block 到達時載入 FE_BUBBLES，之後每拍遞減，期間 fb_take = 0
@@ -69,7 +81,7 @@ wire [1:0] eff_bub   = (~blk_seen_q & fb_valid[0]) ? fe_bubbles : bub_q;
 wire       bub_stall = (eff_bub != 2'd0);
 
 // 連續有效的 uop 數
-wire [2:0] n_avail = fb_valid[0] ? (fb_valid[1] ? (fb_valid[2] ?
+wire [TCW-1:0] n_avail = fb_valid[0] ? (fb_valid[1] ? (fb_valid[2] ?
                      (fb_valid[3] ? 3'd4 : 3'd3) : 3'd2) : 3'd1) : 3'd0;
 
 // fetch block 邊界：不跨 block 取，因為 fb_fe_event 是 per-block
@@ -77,19 +89,19 @@ wire be0 = fb_valid[0] & fb_duop[0*DQ_W + `DUOP_BLKEND];
 wire be1 = fb_valid[1] & fb_duop[1*DQ_W + `DUOP_BLKEND];
 wire be2 = fb_valid[2] & fb_duop[2*DQ_W + `DUOP_BLKEND];
 wire be3 = fb_valid[3] & fb_duop[3*DQ_W + `DUOP_BLKEND];
-wire [2:0] n_blk = be0 ? 3'd1 : be1 ? 3'd2 : be2 ? 3'd3 : be3 ? 3'd4 : 3'd5;
+wire [TCW-1:0] n_blk = be0 ? 3'd1 : be1 ? 3'd2 : be2 ? 3'd3 : be3 ? 3'd4 : 3'd5;
 
 // queue 空間（同拍出隊可回收）
-wire [4:0] free_ent = 5'd16 - rem;
-wire [2:0] n_space  = (free_ent >= 5'd4) ? 3'd4 : free_ent[2:0];
+wire [DQ_CW-1:0] free_ent = DQ_NC - rem;
+wire [TCW-1:0]   n_space  = (free_ent >= W_C) ? W_T : free_ent[TCW-1:0];
 
 // n_in = min(avail, block 邊界, cfg_fetch_width, 空間)
-wire [2:0] lim_a = (n_avail < n_blk)           ? n_avail : n_blk;
-wire [2:0] lim_b = (lim_a   < cfg_fetch_width) ? lim_a   : cfg_fetch_width;
-wire [2:0] lim_c = (lim_b   < n_space)         ? lim_b   : n_space;
-wire [2:0] n_in  = (bub_stall | flush) ? 3'd0 : lim_c;
+wire [TCW-1:0] lim_a = (n_avail < n_blk)           ? n_avail : n_blk;
+wire [TCW-1:0] lim_b = (lim_a   < cfg_fetch_width) ? lim_a   : cfg_fetch_width;
+wire [TCW-1:0] lim_c = (lim_b   < n_space)         ? lim_b   : n_space;
+wire [TCW-1:0] n_in  = (bub_stall | flush) ? 3'd0 : lim_c;
 
-wire blk_end_taken = (n_in != 3'd0) & (n_in >= n_blk);
+wire blk_end_taken = (n_in != {TCW{1'b0}}) & (n_in >= n_blk);
 
 // ================= redirect =================
 // 取到 block 最後一條、且該 block 方向預測錯 -> 切 shadow（wrong path）
@@ -137,21 +149,21 @@ endgenerate
 always @(posedge clk) begin
     if (rst) begin
         dq_q       <= {DQ_N*DQ_W{1'b0}};
-        dq_cnt_q   <= 5'd0;
+        dq_cnt_q   <= {DQ_CW{1'b0}};
         bub_q      <= 2'd0;
         blk_seen_q <= 1'b0;
         shadow_q   <= 1'b0;
         refill_q   <= 1'b0;      // reset 不是 flush：冷啟動的填管線算 cnt_st_fetch
     end else if (flush) begin
         // 後端 flush：清 decode queue、回正確路徑、重新抓 block 事件
-        dq_cnt_q   <= 5'd0;
+        dq_cnt_q   <= {DQ_CW{1'b0}};
         bub_q      <= 2'd0;
         blk_seen_q <= 1'b0;
         shadow_q   <= 1'b0;
         refill_q   <= 1'b1;      // 進入重填視窗
     end else begin
         dq_q       <= dq_nxt;
-        dq_cnt_q   <= rem + {2'b00, n_in};
+        dq_cnt_q   <= rem + {{(DQ_CW-TCW){1'b0}}, n_in};
         bub_q      <= bub_stall ? (eff_bub - 2'd1) : 2'd0;
         blk_seen_q <= blk_end_taken ? 1'b0 :
                       ((~blk_seen_q & fb_valid[0]) ? 1'b1 : blk_seen_q);
@@ -243,5 +255,15 @@ end
 assign cnt_st_fetch  = c_stf_q;
 assign cnt_st_refill = c_rfl_q;
 assign cnt_mispred   = c_mis_q;
+
+// ---------------- 編譯期斷言（CONTRACT v7 §10）----------------
+// 本模組的 lane 邏輯是對 `W = 4 手動展開的（n_avail / n_blk / 填入 mux）。
+// 若 `W 改變，這裡會在 elaboration 就因為找不到模組而報錯，
+// 而不是讓寬度不符被零擴展、安靜地算出錯的結果。
+generate
+if (`W != 4) begin : g_assert_W
+    ERROR_fe_front_requires_W_eq_4 bad_W();
+end
+endgenerate
 
 endmodule

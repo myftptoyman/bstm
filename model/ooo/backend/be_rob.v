@@ -25,7 +25,7 @@
 /* verilator lint_off MULTITOP */   // 四個模組一起 lint 時本來就沒有唯一 top
 module be_rob (
     input  wire clk, input wire rst,
-    input  wire [6:0]            cfg_rob_entries,
+    input  wire [`ROB_W:0]            cfg_rob_entries,
     input  wire [2:0]            cfg_commit_width,
     input  wire [`W-1:0]         ds_valid,
     input  wire [`W*`RUOP_W-1:0] ds_ruop,
@@ -55,7 +55,7 @@ module be_rob (
     reg [`ROB_N*ARFD_W-1:0] rob_a;            // RUOP_ARFD：架構目的暫存器 x0..x31
     reg [`ROB_N*`PRF_W-1:0] rob_d;            // RUOP_D：寫入的實體暫存器（packed，避免記憶體推斷）
     reg [`ROB_W-1:0] rob_head;
-    reg [6:0]        rob_cnt;                 // 0..64
+    reg [`ROB_W:0]   rob_cnt;                 // 0..ROB_N（含），需 ROB_W+1 位元
     reg [47:0]       c_cycles, c_retired, c_wrong, c_occ;
 
     // ---------------------------------------------- 組合暫存
@@ -63,7 +63,7 @@ module be_rob (
     reg [`W*`PRF_W-1:0]  c_prf;
     reg [`W*`ROB_W-1:0]  c_idx;
     reg [`ROB_W-1:0]     h_idx, fl_idx;
-    reg [6:0]            h_p1;
+    reg [`ROB_W:0] h_p1;
     reg [2:0]            n_cmt;
     reg                  stop, do_flush;
     reg [3+ARFD_W+`PRF_W:0] ent;
@@ -104,7 +104,7 @@ module be_rob (
         c_prf    = {(`W*`PRF_W){1'b0}};
         c_arf    = {(`W*`ARF_W){1'b0}};
         c_idx    = {(`W*`ROB_W){1'b0}};
-        h_p1     = 7'd0;
+        h_p1     = {(`ROB_W+1){1'b0}};
         ent = {(4+ARFD_W+`PRF_W){1'b0}};
         for (cj = 0; cj < `W; cj = cj + 1) begin
             ent = rd_ent(h_idx);
@@ -122,7 +122,7 @@ module be_rob (
                     c_arf[cj*`ARF_W +: `ARF_W] = {{(`ARF_W-ARFD_W){1'b0}}, ent[`PRF_W +: ARFD_W]};
                     c_idx[cj*`ROB_W +: `ROB_W] = h_idx;
                     n_cmt     = n_cmt + 3'd1;
-                    h_p1      = {1'b0, h_idx} + 7'd1;
+                    h_p1      = {1'b0, h_idx} + {{`ROB_W{1'b0}},1'b1};
                     h_idx     = (h_p1 >= cfg_rob_entries) ? {`ROB_W{1'b0}}
                                                           : h_p1[`ROB_W-1:0];
                 end
@@ -134,8 +134,8 @@ module be_rob (
 
     wire [2:0] n_disp = {2'b0, ds_valid[0]} + {2'b0, ds_valid[1]}
                       + {2'b0, ds_valid[2]} + {2'b0, ds_valid[3]};
-    wire [6:0] occ_nxt = rob_cnt + {4'b0, n_disp} - {4'b0, n_cmt};
-    wire [6:0] n_kill  = rob_cnt - {4'b0, n_cmt};     // flush 當拍被丟掉的 uop 數
+    wire [`ROB_W:0] occ_nxt = rob_cnt + {{(`ROB_W-2){1'b0}}, n_disp} - {{(`ROB_W-2){1'b0}}, n_cmt};
+    wire [`ROB_W:0] n_kill  = rob_cnt - {{(`ROB_W-2){1'b0}}, n_cmt};     // flush 當拍被丟掉的 uop 數
 
     assign flush           = do_flush;
     assign flush_robidx    = fl_idx;
@@ -161,7 +161,7 @@ module be_rob (
             rob_dv   <= {`ROB_N{1'b0}};
             rob_a    <= {(`ROB_N*5){1'b0}};
             rob_head <= {`ROB_W{1'b0}};
-            rob_cnt  <= 7'd0;
+            rob_cnt  <= {(`ROB_W+1){1'b0}};
             c_cycles <= 48'd0;
             c_retired<= 48'd0;
             c_wrong  <= 48'd0;
@@ -169,15 +169,15 @@ module be_rob (
             rob_d    <= {(`ROB_N*`PRF_W){1'b0}};
         end else begin
             c_cycles <= c_cycles + 48'd1;
-            c_occ    <= c_occ    + {41'd0, rob_cnt};
+            c_occ    <= c_occ    + {{(47-`ROB_W){1'b0}}, rob_cnt};
             c_retired<= c_retired+ {45'd0, n_cmt};
-            if (do_flush) c_wrong <= c_wrong + {41'd0, n_kill};
+            if (do_flush) c_wrong <= c_wrong + {{(47-`ROB_W){1'b0}}, n_kill};
 
             if (do_flush) begin
                 rob_v    <= {`ROB_N{1'b0}};
                 rob_done <= {`ROB_N{1'b0}};
                 rob_head <= {`ROB_W{1'b0}};
-                rob_cnt  <= 7'd0;
+                rob_cnt  <= {(`ROB_W+1){1'b0}};
             end else begin
                 rob_head <= h_idx;
                 rob_cnt  <= occ_nxt;

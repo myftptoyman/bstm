@@ -233,6 +233,41 @@ model:
   counts as full. Adding LDQ/STQ entries would achieve nothing; the protocol is what needs
   to change.
 
+### The ROB sweep, and a bug that only a sweep could find
+
+| `cfg_rob_entries` | IPC | ROB stall | ROB occupancy |
+|---|---|---:|---:|
+| 64 | 1.439 | 5,769 | 28.7 |
+| 96 | 1.443 | 982 | 29.3 |
+| 128 | 1.443 | 12 | 29.2 |
+
+Doubling the ROB buys 0.3 %. Like the register file, it is not the bottleneck — average
+occupancy is 29 of 128 entries, and the LSQ and IQ are queued up behind it.
+
+Getting to those numbers required fixing a failure mode specific to the max-size-plus-mask
+pattern. Raising `cfg_rob_entries` past 64 collapsed IPC from 1.391 to 0.072. The cause was
+not a width mismatch — it was a *capacity* shortfall in `be_eu`, whose completion wheel was
+4 lanes × 16 slots. When `lsu_done` wins a writeback port the losing entry is rescheduled to
+a later free slot; a larger ROB means more in-flight uops, more contention, and eventually
+no free slot, at which point the entry was **silently dropped**. Four drops in 500,000
+cycles were enough, because each one wedges a ROB head permanently.
+
+Three things about this are worth generalising:
+
+- **Static checking cannot see it.** `[6:0]` assigned to `[6:0]` is legal; the problem is
+  that 7 bits cannot hold the value 128. Lint and synthesis both pass.
+- **Testing the default configuration cannot see it.** Built at `ROB_N` = 128 but masked to
+  64, the model is bit-identical to a 64-entry build and every test passes. The path above
+  64 had never been executed.
+- **Filling a structure is not the same as filling it under contention.** A workload that
+  pushed 64 uops in flight did not trigger it; one that also contended for the writeback
+  port did.
+
+The fix replaced the wheel with a pool addressed by `robidx`, so that each in-flight uop
+owns its slot by construction — no allocation, no free-slot search, no path that can drop.
+State went *down* by 165 bits and IPC at the original 64-entry setting improved 3.5 %,
+because the reschedule path had been costing performance even when it wasn't dropping.
+
 **A sweep-design consequence worth knowing:** because the modelling rules require max-size
 structures with a runtime mask, `cfg_iq_entries = 48` costs exactly what 64 costs. IQ is
 really a choice between 32 and 64, LDQ/STQ between 16 and 32, and PRF 96 sits at the same
