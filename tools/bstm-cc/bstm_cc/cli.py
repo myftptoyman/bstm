@@ -30,6 +30,9 @@ def build_parser():
     ap.add_argument("--scheduler", default="auto",
                     choices=["auto", "greedy", "dfs"],
                     help="slot 排程啟發式（預設 auto：兩種都跑，取 slot 少的）")
+    ap.add_argument("--chunk", type=int, default=1000,
+                    help="每個 static 子函式最多幾個 op（0 = 不切；預設 1000）。"
+                         "大設計不切的話 gcc 的最佳化會超線性爆炸")
     ap.add_argument("--no-alloc", action="store_true",
                     help="關掉 liveness/slot 配置（每個值一個 slot），用來做效能對照")
     ap.add_argument("-q", "--quiet", action="store_true", help="不要印警告")
@@ -47,7 +50,7 @@ def main(argv=None):
             disable_alloc(d)
         backend = be.make(args.backend)
         em = be.Emitter(d, backend, lanes=args.lanes,
-                        comments=not args.no_comments)
+                        comments=not args.no_comments, chunk=args.chunk)
         text = em.emit()
     except BstmError as e:
         sys.stderr.write("bstm-cc: 錯誤: %s\n" % e)

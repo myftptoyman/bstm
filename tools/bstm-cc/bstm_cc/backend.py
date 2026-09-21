@@ -118,10 +118,11 @@ def check_names(ports):
 
 
 class Emitter(object):
-    def __init__(self, design, backend, lanes=None, comments=True):
+    def __init__(self, design, backend, lanes=None, comments=True, chunk=1000):
         self.d = design
         self.be = backend
         self.comments = comments
+        self.chunk = chunk
         if lanes is not None and lanes != backend.lanes:
             raise BstmError("backend %s 的 lane 數固定是 %d，不能設成 %d"
                             % (backend.name, backend.lanes, lanes))
@@ -146,13 +147,21 @@ class Emitter(object):
         return "bstm_s[%d]" % self.d.slot_of[v]
 
     # ------------------------------------------------ 介面
-    def signature(self):
-        args = ["state_t *restrict next", "const state_t *restrict cur"]
+    def in_params(self):
+        out = []
         for p in self.d.inputs:
             if p.width == 1:
-                args.append("vec_t %s" % c_ident(p.name))
+                out.append("vec_t %s" % c_ident(p.name))
             else:
-                args.append("const vec_t %s[%d]" % (c_ident(p.name), p.width))
+                out.append("const vec_t %s[%d]" % (c_ident(p.name), p.width))
+        return out
+
+    def in_args(self):
+        return [c_ident(p.name) for p in self.d.inputs]
+
+    def signature(self):
+        args = ["state_t *restrict next", "const state_t *restrict cur"]
+        args += self.in_params()
         for p in self.d.outputs:
             if p.width == 1:
                 args.append("vec_t *%s" % c_ident(p.name))
@@ -160,6 +169,12 @@ class Emitter(object):
                 args.append("vec_t %s[%d]" % (c_ident(p.name), p.width))
         return ("void eval_cycle(" +
                 (",\n                       ".join(args)) + ")")
+
+    def chunk_signature(self, k):
+        args = ["vec_t *restrict bstm_s", "state_t *restrict next",
+                "const state_t *restrict cur"] + self.in_params()
+        return ("static void bstm_chunk_%d(" % k +
+                (",\n        ".join(args)) + ")")
 
     def emit(self):
         d = self.d
@@ -189,11 +204,29 @@ class Emitter(object):
         self.emit_state()
         self.emit_init()
         P("")
+        chunks = self.split_stream()
+        if len(chunks) > 1:
+            P("/* 產生的程式碼切成 %d 段 static 函式：gcc 的最佳化在單一超大"
+              % len(chunks))
+            P(" * basic block 上是超線性的，切開之後編譯時間才會回到線性。 */")
+            for k, part in enumerate(chunks):
+                P(self.chunk_signature(k))
+                P("{")
+                self.emit_instrs(part)
+                P("}")
+                P("")
         P(self.signature())
         P("{")
         if d.nslots:
             P("    vec_t bstm_s[%d];" % d.nslots)
-        self.emit_body()
+        if len(chunks) > 1:
+            call = ", ".join(["bstm_s", "next", "cur"] + self.in_args())
+            for k in range(len(chunks)):
+                P("    bstm_chunk_%d(%s);" % (k, call))
+            self.emit_instrs(self.out_instrs())
+        else:
+            self.emit_instrs(chunks[0] if chunks else [])
+            self.emit_instrs(self.out_instrs())
         P("}")
         P("")
         self.emit_desc()
@@ -226,11 +259,31 @@ class Emitter(object):
             P("    st->q[%d] = VONES;" % k)
         P("}")
 
-    def emit_body(self):
+    def split_stream(self):
+        """把 op/ff 指令切成每段至多 chunk 個 op 的區塊（out 指令另外處理）。"""
+        body = [i for i in self.d.stream if i.op != "out"]
+        if not self.chunk or len(body) <= self.chunk:
+            return [body]
+        parts, cur, n = [], [], 0
+        for ins in body:
+            cur.append(ins)
+            if ins.op == "op":
+                n += 1
+                if n >= self.chunk:
+                    parts.append(cur)
+                    cur, n = [], 0
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def out_instrs(self):
+        return [i for i in self.d.stream if i.op == "out"]
+
+    def emit_instrs(self, instrs):
         d = self.d
         b = d.builder
         P = self.P
-        for ins in d.stream:
+        for ins in instrs:
             if ins.op == "op":
                 kind = b.op_kind(ins.value)
                 args = tuple(self.ref(a) for a in b.op_args(ins.value))

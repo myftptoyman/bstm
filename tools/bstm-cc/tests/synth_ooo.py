@@ -18,15 +18,10 @@ FILES = ["top.v", "frontend/fe_front.v", "rename/rn_rename.v",
 
 
 def sync():
+    """把 model/ooo/ 複製一份進 tests/data/ooo（bstm-cc 不寫自己目錄以外的地方）。"""
     if not os.path.isdir(SRC):
         return False
-    os.makedirs(SNAP, exist_ok=True)
-    shutil.copy(os.path.join(SRC, "common", "ifc.vh"),
-                os.path.join(SNAP, "common", "ifc.vh")
-                if os.path.isdir(os.path.join(SNAP, "common"))
-                else (os.makedirs(os.path.join(SNAP, "common")) or
-                      os.path.join(SNAP, "common", "ifc.vh")))
-    for f in FILES:
+    for f in FILES + ["common/ifc.vh"]:
         dst = os.path.join(SNAP, f)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy(os.path.join(SRC, f), dst)

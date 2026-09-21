@@ -12,9 +12,10 @@ word-level 網表，吐出「每一行同時算 64/128/512 個 instance」的純
 | cell 覆蓋 | 12 種 | 34 種組合 + 7 種 FF + memory |
 | 不支援的 cell | 靜默產生 `/* TODO */` | 明確報錯 + cell 名 + 來源行號 |
 | 多 backend | 無 | `c64` / `neon` / `avx512`（PLAN §6.4c） |
-| `SRST_VALUE` / polarity | 忽略（一律當 0、一律 active-high） | 完整處理 |
+| `SRST_VALUE` / polarity | **有 bug**：`gen.py:156` 算了 `rv` 卻沒用，同步 reset 值一律變成 0 | 完整處理，有回歸測試 |
 | `$pmux` 的 default 路徑 | 忽略 A | 照 yosys simlib 語意 |
-| 驗證 | 無 | Verilator 逐 cycle 對拍 + 30 個自測 |
+| 產生的函式 | 一個超大函式 | 切成 static 子函式（gcc 在單一超大 BB 上是超線性的） |
+| 驗證 | 無 | Verilator 逐 cycle 對拍（含真實 38.5k cell 模型）+ 33 個自測 |
 
 ---
 
@@ -31,6 +32,8 @@ bstm-cc <netlist.json> <top-module> [--backend c64] [--lanes 64] [-o out.c] [--s
 | `-o FILE` | 輸出（預設 stdout） |
 | `--stats` | 把 net / slot / op 統計印到 stderr |
 | `--no-comments` | 不放 net 名稱註解（大設計可少掉一半檔案大小） |
+| `--scheduler {auto,greedy,dfs}` | slot 排程啟發式，預設 `auto`（兩個都跑取比較好的） |
+| `--chunk N` | 每個 `static` 子函式最多幾個 op（預設 1000，0 = 不切） |
 | `--no-alloc` | 關掉 slot 配置，每個值一個 slot。**只用來做效能對照** |
 | `-q` | 不印警告 |
 
@@ -101,18 +104,69 @@ bstm-cc 的做法：
 3. **配置** —— 直線程式的干涉圖是 interval graph，依起點做線性掃描貪婪著色
    就是最佳解，不必跑一般的圖著色。
 
+排程有兩種啟發式，預設 `auto` 兩個都跑一次、取 slot 少的那個
+（`--scheduler {auto,greedy,dfs}` 可以指定）：
+
+* **greedy** —— 全域的壓力導向 list scheduling。對 `chain_big` 這種很多獨立
+  平行區塊的設計比較好。
+* **dfs** —— 從 sink 往回做 DFS post-order，值一算出來馬上被消費掉。
+  對真實 OOO 模型這種「大量單一使用者的中間值」好非常多（8,856 → 3,432 slot）。
+
 實測：
 
-| 設計 | cell | net bit | slot | 壓縮比 | 工作集 (64 lane) |
-|---|---|---|---|---|---|
-| `ops`（cell 覆蓋測試） | 68 | 310 | 14 | 22x | 112 B |
-| `chain`（32 級） | 815 | 1,774 | 28 | **63x** | 224 B |
-| `chain_big`（800 級） | 20,015 | 43,246 | 39 | **1,109x** | **312 B** |
+| 設計 | cell | net bit | bitwise op | slot | 壓縮比 | 工作集 (64 lane) | 排程器 |
+|---|---|---|---|---|---|---|---|
+| `ops`（cell 覆蓋測試） | 68 | 310 | 310 | 14 | 22x | 112 B | greedy |
+| `chain`（32 級） | 815 | 1,774 | 2,658 | 25 | **71x** | 200 B | dfs |
+| `chain_big`（800 級） | 20,015 | 43,246 | 66,402 | 39 | **1,109x** | 312 B | greedy |
+| **`ooo_top`（真實模型）** | **38,549** | **139,924** | **141,317** | **3,432** | **40.8x** | **27,456 B** | dfs |
 
-20,015 cell 的模型只要 312 bytes 的工作集 —— 完全在 L1 裡，達成 PLAN §10.2
-「數百個 slot、塞進 L2」的目標還有很大餘裕。
+`ooo_top` 是 `model/ooo/` 的完整 4-issue OOO timing model。**27 KB 工作集** ——
+PLAN §10.2 要求 < 512 KB 才塞得進 L2，這裡連 L1 都塞得下，餘裕 19 倍。
+
+註：cell 數會低估成本（Agent F 量到 `be_iq` 的 7,852 cell 展開成 93,707 gate）。
+上表的 **bitwise op** 才是真正的每 cycle 工作量 —— 那是 `eval_cycle()` 裡實際
+會執行的敘述數，DCE 與化簡之後的數字。
 
 `--stats` 會把這張表印出來。
+
+### 為什麼還要切函式
+
+slot 配置解決的是**資料**工作集。但產生的 C 還有另一個問題：所有東西在同一個
+函式的同一個 basic block 裡，而 gcc 的最佳化在超大 BB 上是超線性的。
+
+bstm-cc 預設把 op 切成每段 1,000 個的 `static` 子函式（`--chunk N`，0 = 不切）。
+slot 是一個真的陣列，所以跨函式邊界沒有問題。實測（`gcc -O2 -march=native`）：
+
+| 設計 | 不切 | `--chunk 1000` | `--chunk 400` |
+|---|---|---|---|
+| `chain_big`（66,402 op） | 1,033 s | **20 s** | 15 s |
+| `ooo_top`（141,317 op） | ~1,000 s | **110 s** | 63 s |
+
+`chain_big` 的執行速度 chunk=1000 跟不切一樣（0.083 M target-cycles/s），
+chunk=400 會掉約 10%，所以預設取 1000。
+
+### 效能實測（Intel i7-12700，單核，`gcc -O3 -march=native`）
+
+`chain`（815 cell，`prototype/cbench.c` 的刺激，checksum 兩邊都是 `aa38064b48fd97c0`）：
+
+| 版本 | 編譯 | 執行 | 工作集 |
+|---|---|---|---|
+| `prototype/gen.py` | 2.62 s | 3.15 M target-cycles/s | 1,774 個區域變數 |
+| bstm-cc `--no-alloc` | 2.85 s | 1.50 M target-cycles/s | 2,658 slot |
+| **bstm-cc** | **0.66 s** | **3.79 M target-cycles/s** | **25 slot / 200 B** |
+
+815 cell 的設計本來就塞得進 L1，gcc 自己也會做 liveness，所以執行速度只快 20%
+（快的部分來自 P2 的化簡：敘述數少 41%）。**liveness 的價值在規模上**：
+
+`chain_big`（20,015 cell，66,402 op）：bstm-cc 產生的 C 在 `-O2` 下 20 秒編完、
+跑 0.083 M target-cycles/s（5.3 M instance-cycles/s）。同一份網表丟給
+`prototype/gen.py`，產生 132,101 個敘述 + 43,246 個區域變數，`gcc -O3` 跑了
+**45 分鐘還沒編完**（放棄）。
+
+> 規模上來之後，**指令**足跡取代資料工作集變成新瓶頸：66,402 個 op 大約 400 KB
+> 的程式碼，遠大於 32 KB 的 L1i。這是下一個該處理的題目（PLAN 沒提到），
+> 不是 slot 配置能解的。
 
 ---
 
@@ -193,8 +247,9 @@ PLAN §6.5 改成 bit-matrix 或走 refill 區。
 ## 測試
 
 ```bash
-make test     # 30 個自測（pytest 或 unittest 都可以）
+make test     # 33 個自測（pytest 或 unittest 都可以）
 make cosim    # 跟 Verilator 逐 cycle 對拍 ops / chain / memtest
+make ooo      # 從 model/ooo/ 取真實模型、合成、對拍、印壓縮比
 make bench    # chain 的效能對照：原型 vs 無 liveness vs 有 liveness
 ```
 
@@ -210,7 +265,11 @@ make bench    # chain 的效能對照：原型 vs 無 liveness vs 有 liveness
 * 合成網表上的 cell 語意：`$bmux` `$demux` `$xnor` `$reduce_xnor` `$sshl`
   `$pos` `$adff`、位移溢位、有號/無號比較的全 16×16 真值表
 * `chain` 的 checksum 必須等於原型 `gen.py` 的 `aa38064b48fd97c0`
-* Verilator 對拍：`ops`（34 種算子）、`chain`（815 cell）、`memtest`（記憶體）
+* **同步 reset 值回歸**：從網表算出「rst 拉高一拍後」每個 state bit 該是什麼，
+  跟實際跑出來的比對。`stage.v` 的 `credit` reset 成 15，原型會給 0
+* Verilator 對拍：`ops`（34 種算子）、`chain`（815 cell）、`memtest`（記憶體）、
+  **`ooo_top`（38,549 cell 的真實模型，533 個輸出 bit）**
+  —— 對拍的刺激會隨機拉 `rst`，所以 reset 值的路徑一定會走到
 
 ### 檔案
 
@@ -223,4 +282,28 @@ bstm_cc/compiler.py  state 配置、拓樸排序、cell 展開、DCE、排程、
 bstm_cc/backend.py   word 型別抽象（c64/neon/avx512）+ C 產生
 bstm_cc/errors.py    錯誤型別
 tests/               自測、Verilator 對拍、測試用 Verilog、規模測試產生器
+tests/synth.py       docker yosys 包裝
+tests/synth_ooo.py   從 model/ooo/ 抓真實模型 + 合成
+tests/cosim.py       Verilator 對拍（逐 cycle、逐 bit）
+tests/gen_chain.py   N 級 chain 產生器（規模測試）
 ```
+
+## 已知的上游問題
+
+`prototype/gen.py` 第 156 行：
+
+```python
+SR = bits(cn['SRST'])[0] if 'SRST' in cn else None
+...
+rv = "VZERO"                       # <- 算了但從來沒用
+P(f"    s->q{q} = ({D[i]} & {e}) | (p->q{q} & ~{e}" + (f" & ~{SR}" if SR else "") + ");")
+```
+
+所有 `$sdff`/`$sdffe` 的 `SRST_VALUE` 都被當成 0。`prototype/stage.v` 的
+`credit` 是 reset 成 `{CREDIT_W{1'b1}}`（=15），所以原型在 reset 之後
+**靜默算錯**。實測：拿同一份 `chain.json`，隨機拉 rst 跟 Verilator 對拍，
+原型在 **cycle 62** 的 `in_ready` 就分岔了；bstm-cc 400 cycle 全對。
+
+`prototype/gen.py` 是驗證用的原型，不歸 bstm-cc 管，這裡只記錄下來。
+`prototype/cbench.c` 的刺激從頭到尾 `rst = VZERO`，所以踩不到這個 bug ——
+這也是為什麼 bstm-cc 產生的 C 在那個 benchmark 下 checksum 跟原型一模一樣。

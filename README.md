@@ -89,11 +89,48 @@ All numbers on an Intel i7-12700, single core unless stated, gcc `-O3 -march=nat
 Verilator is insensitive to field width (5.99 → 5.91); BSTM loses 3×. This is why
 rule 1 exists.
 
-**Integrated model**
+**Integrated model** — 4-issue OOO, 10 stages, ROB 64 / IQ 32 / LDQ-STQ 16 / MSHR 8 / PRF 64:
 
 ```
 ooo_top:  38,549 cells   0 memories   0 latches   0 variable shifts
+          139,924 nets  →  3,432 slots   (40.8x liveness compression)
+          141,317 bitwise ops per target cycle
+          working set:  27 KB slots + 77 KB state = 104 KB   (target was < 512 KB)
 ```
+
+Verified **bit-exact against Verilator on the real 38,549-cell model**, cycle by cycle,
+every output bit. The equivalence harness also randomly asserts reset, so the reset
+path is always exercised.
+
+**Backend comparison** — four ways to turn 141,317 ops/cycle into something runnable:
+
+| backend | compile | target-cycles/s | ops/s |
+|---|---|---|---|
+| one big function + gcc -O1 | **OOM after 10 min (27 GB)** | — | — |
+| bytecode interpreter | 0.02 s | 4.8 K | 0.68 G |
+| hand-emitted x86-64 JIT | **0.003 s** | 11.8 K | 1.66 G |
+| **36 split functions + gcc -O2** | 4 min 47 s | **36.7 K** | **5.19 G** |
+
+Three things this measurement settles:
+
+1. **Emitting one large C function does not scale.** Splitting into functions — the same
+   trick Verilator uses for `--output-split` — is mandatory, not an optimisation.
+2. **"There is no register allocation left to do" is wrong.** The hand-written JIT does
+   load-load-op-store for every op (28 bytes/op); gcc wins 3.1x by keeping local chains
+   in registers.
+3. **A JIT's value here is compile time, not speed** — 0.003 s versus 287 s, a factor of
+   95,000. Sweeping 100 structural configurations costs 8 hours with gcc and 0.3 s with
+   a JIT. Both backends have a place.
+
+For anyone building this properly: CIRCT's **arcilator** already compiles hardware
+dialects to LLVM IR and JITs them, with an `arc` dialect designed for simulation. It does
+not bit-slice, but that is an `i1`→`i64` type conversion pass in MLIR — a far better
+starting point than hand-rolling a JIT.
+
+**A bottleneck the design document did not anticipate:** once liveness compresses the
+*data* working set to 27 KB, the *instruction* footprint takes over. 141,317 ops is
+roughly 800 KB of machine code against a 32 KB L1i. A 20,015-cell design measures ~1.7x
+slower than linear extrapolation predicts. This is now the top open problem.
 
 Gate-level (the honest metric — `proc; opt` cell counts are misleading by up to 12×):
 
@@ -117,6 +154,29 @@ mock_ooo_top    414,142 cycles   5,797,988 signal-compares   0 mismatches
 |---|---|---|
 | 64×64 bit transpose | 228 ns | **45.8 ns** (AVX2) |
 | `unpack_lanes(3 bit)` | 98 ns | **12.6 ns** (BMI2 `pdep`) |
+
+**End-to-end IPC** — the real model, the real CoreMark trace, via Verilator:
+
+```
+IPC 1.381     (ROB occupancy 28.5 / 64)
+
+stall breakdown        cycles      share
+  rename              254,365      51 %     <- physical register file exhausted
+  lsq                 112,212      22 %
+  iq                   82,639      17 %
+  fetch                54,584      11 %
+  rob                     141    0.03 %     <- ROB almost never full
+  mshr                      0       0 %     <- CoreMark fits in L1D
+```
+
+**This number is an upper bound**, and knowing why matters more than the number: wrong-path
+shadow expansion is not implemented yet (`shadow_off` is 0 everywhere), so no misprediction
+penalty is ever paid. With a 4.93 % block mispredict rate and a ~12-cycle penalty, the true
+figure is likely nearer 1.0–1.1.
+
+The stall breakdown is the first genuine design finding the model has produced: rename
+dominates while the ROB is essentially never full. PRF 64 against ROB 64 is badly
+unbalanced — real 4-issue designs use 1.5–2x. That is a configuration conclusion, not a bug.
 
 **CoreMark trace** (real Spike, 50 M instructions from steady state):
 

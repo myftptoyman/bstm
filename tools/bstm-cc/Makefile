@@ -5,13 +5,14 @@ CC      ?= gcc
 CFLAGS  ?= -O3 -march=native
 BUILD   ?= build
 
-.PHONY: test cosim bench bench-big netlists clean help
+.PHONY: test cosim cosim-ooo ooo bench bench-big netlists clean distclean help
 
 help:
 	@echo "make test      —— 跑自測（pytest 或 unittest）"
 	@echo "make cosim     —— 跟 Verilator 逐 cycle 對拍"
 	@echo "make bench     —— chain（815 cell）效能對照：原型 / 無 liveness / 有 liveness"
 	@echo "make bench-big —— 800 級 chain（20,015 cell）同上；會跑很久（原型那一份編譯要好幾分鐘）"
+	@echo "make ooo       —— 取 model/ooo/ 的真實模型，合成 + 壓縮比 + Verilator 對拍"
 	@echo "make netlists  —— 用 docker yosys 重新產生測試網表"
 
 test:
@@ -26,6 +27,11 @@ cosim:
 	cd tests && $(PY) cosim.py ops ops.v
 	cd tests && $(PY) cosim.py chain stage.v chain.v
 	cd tests && $(PY) cosim.py memtest memtest.v
+
+ooo:
+	cd tests && $(PY) synth_ooo.py
+	./bstm-cc tests/data/ooo/ooo_top.json ooo_top --stats --no-comments -o $(BUILD)/ooo_top.c
+	$(PY) -W ignore::ResourceWarning -m unittest discover -s tests -p "test_*.py" -k RealModel -v
 
 netlists:
 	cd tests && $(PY) synth.py chain stage.v chain.v
@@ -63,3 +69,8 @@ $(BUILD):
 
 clean:
 	rm -rf $(BUILD) __pycache__ bstm_cc/__pycache__ tests/__pycache__
+
+# 連合成出來的網表一起砍（chain_big.json 21 MB、ooo_top.json 37 MB，
+# 都可以用 make netlists / make ooo 重生）
+distclean: clean
+	rm -f tests/data/chain_big.json tests/data/ooo/ooo_top.json

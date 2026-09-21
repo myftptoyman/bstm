@@ -148,3 +148,20 @@ Agent H 目前的 `.mem` 第一筆 delta 已是 1，導致索引跑 1..N 而非 
 - **【F】`cfg_ldq_entries`/`cfg_stq_entries` 必須 ≥ 4**（dispatch 是 all-or-nothing 收 W=4）。
 - **【F】`done_dv` 不存在**：store 沒有 dst，`be_eu` 用自己的 `mem_dv[rob]` 表判斷。此約定為契約。
 - **【F/監督者】成本度量一律用 gate-level**（`ci/gate_count.sh`），不得用 `proc; opt` 的 cell 數。實證：`be_iq` cells=7,852 但 gates=93,707（11.9×），`lsu_q` cells=12,743 但 gates=27,949（2.2×）—— cell 數會給出完全相反的排序。
+
+## v5（2026-09-21 19:15）— demo 完成後的收尾
+
+| # | 問題 | 處置 |
+|---|---|---|
+| 30 | `tools/bstm-cc/Makefile` 的 `ooo` target 缺 `mkdir -p build`，`make clean` 之後整個驗證流程在乾淨 checkout 上跑不起來 | 需補一行。監督者曾誤判成「Agent C 正在重新產生檔案」 |
+| 31 | **監督者的單位錯誤**：把工作集算成 `3,432 slot × 64 lane × 8 B = 6.5 MB`，據此宣布「塞不進 L2、方案可能不划算」。正確值 `3,432 × 8 B = 27 KB` —— 一個 `vec_t` 本身就是 64 lane，不可再乘 | 差 64 倍，結論完全相反。與 F 發現的 cell-vs-gate 是同一類錯誤，30+ 個缺陷裡第二次。**任何效能數字必須附推導過程** |
+| — | 監督者違反自己訂的所有權規則，在 `tools/bstm-cc/build/` 裡做實驗，被 `make clean` 清空 | 產物要先複製到自己的空間 |
+
+### 最終驗收
+
+```
+ooo_top（38,549 cells）bit-sliced vs Verilator
+  test_bit_exact_vs_verilator ... ok
+  test_working_set_fits_l2    ... ok
+  Ran 2 tests — OK
+```
