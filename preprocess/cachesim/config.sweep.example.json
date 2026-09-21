@@ -1,0 +1,16 @@
+{
+  // 多配置單次掃描範例：L1/L3 固定，一次掃出 5 組 L2 大小的結果。
+  // 注意：sweep 模式下 l2.inclusive 必須為 false（見 README「精確性條件」）。
+  "line_size": 64,
+  "l1i": { "size": 32768,  "ways": 8 },
+  "l1d": { "size": 32768,  "ways": 8 },
+  "l2":  { "size": 524288, "ways": 8, "inclusive": false },
+  "l3":  { "enabled": false },
+  "prefetcher": { "enabled": false },
+
+  "sweep": {
+    "level": "l2",
+    "ways": 8,
+    "sizes": [131072, 262144, 524288, 1048576, 2097152]
+  }
+}

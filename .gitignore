@@ -1,0 +1,55 @@
+# ---- 大型資料，不進版控 ----
+# CoreMark trace 共 2.3 GB，由 preprocess/spike 從 Spike 重新產生
+traces/
+*.bstf
+*.fe
+*.fe.wp
+*.mem
+*.imem
+
+# 合成出來的網表（可由 Verilog + Yosys 重建，見 tools/bstm-cc/tests/synth*.py）
+tools/bstm-cc/tests/data/**/*.json
+tools/bstm-cc/tests/data/ooo/
+tools/bstm-cc/tests/data/chain_big*
+
+# 各 agent 的 selftest 產物（可重新產生）
+preprocess/spike/selftest/
+preprocess/frontend/selftest_out/
+
+# ---- 建置產物 ----
+build/
+obj_*/
+*.o
+*.d
+*.a
+*.so
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Verilator
+obj_dir/
+V*.h
+V*.cpp
+V*.mk
+
+# 各 agent 的執行檔
+preprocess/frontend/build/
+preprocess/cachesim/cachesim
+preprocess/cachesim/build/
+preprocess/spike/build/
+preprocess/spike/elf/
+preprocess/spike/bstf_gen
+preprocess/spike/bstf_check
+preprocess/frontend/frontend_sim
+preprocess/frontend/fe_check
+test/build/
+test/*/build/
+lib/runtime/*.o
+
+# ---- 雜項 ----
+*.log
+*.vcd
+*.fst
+core
+.DS_Store

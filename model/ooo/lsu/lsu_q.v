@@ -1,0 +1,737 @@
+`include "common/ifc.vh"
+// ===================================================================
+// BSTM OOO model — LSU: LDQ / STQ / MSHR            (Agent F)
+//
+// 本模組負責「離線算不出來的那一半」：MSHR 佔用與 memory-level
+// parallelism (MLP)。cache 的 hit/miss 與無負載延遲是離線算好的，
+// 經 fb_mem_event 餵進來（MEM_LEVEL = bit[1:0]，MEM_LAT_CLASS = bit[7:4]，
+// 查 include/bstf.h 的 bstf_lat_table 得 base latency）。
+//
+// 結構（都是 MAX 尺寸 + cfg_* runtime mask）：
+//   LDQ  16 entry  環狀佇列，in-order dealloc
+//   STQ  16 entry  環狀佇列，in-order dealloc（= commit + store buffer drain 代理）
+//   MSHR  8 entry  v(1) + countdown(8) + rob(6) + prf(6) + ldq(4) + dead(1)
+//   L1-hit 延遲線  8 級 x 2 slot 的純移位暫存器（hit 不佔 MSHR）
+//   請求緩衝       8 深 FIFO，每拍最多收 4、送 2（2 個 LSU port）
+//
+// 建模硬規則：
+//   1. 欄位 <= 8 bit，無寬算術（唯一例外是 CONTRACT §1.5 要求的 48-bit counter）
+//   2. MAX 尺寸 + cfg_ldq_entries / cfg_stq_entries mask
+//   3. 單一 posedge clk + 同步 rst；陣列全是 flat packed reg，索引一律用
+//      常數展開的 for 迴圈 → 不會推出 $mem / 非同步讀 / latch
+//   4. 沒有 case，全部 if/else 鏈（函式 lat_lut 有 final else）
+//   5. 沒有 $display / $finish / initial / DPI
+// ===================================================================
+module lsu_q (
+    input  wire clk, input wire rst, input wire flush,
+    input  wire [4:0]            cfg_ldq_entries,
+    input  wire [4:0]            cfg_stq_entries,
+    input  wire [`W-1:0]         ds_valid,
+    input  wire [`W*`RUOP_W-1:0] ds_ruop,
+    input  wire [`W*`ROB_W-1:0]  ds_robidx,
+    input  wire [`W-1:0]         req_v,
+    input  wire [`W*`ROB_W-1:0]  req_rob,
+    input  wire [`W*8-1:0]       req_ev,     // 未用，保留
+    output wire                  lsu_ready,
+    output wire                  lsq_full,
+    output wire                  mshr_full,
+    output wire [`W-1:0]         done_v,
+    output wire [`W*`ROB_W-1:0]  done_rob,
+    output wire [`W*`PRF_W-1:0]  done_prf,
+    input  wire [`W*8-1:0]       fb_mem_event,
+    // v2（監督者裁決）：mem event 是 per fetch-buffer slot，跟 dispatch 差數拍，
+    // 所以在本模組內自建 side FIFO：fetch 當拍 push、dispatch 當拍 pop。
+    input  wire [`W-1:0]         fb_valid,
+    input  wire [`W*`DUOP_W-1:0] fb_duop,
+    input  wire [2:0]            fb_take,
+    output wire [47:0]           cnt_st_mshr
+);
+    // ---------------- 可調參數 ----------------
+    parameter CONF_THR = 8;    // store-load 衝突機率 = CONF_THR/256（8 -> 3.1%）
+    parameter ST_LAT   = 2;    // store 寫進 store buffer 的固定延遲
+
+    localparam LDN = 16;       // LDQ MAX
+    localparam STN = 16;       // STQ MAX
+    localparam MSN = 8;        // MSHR MAX（top.v 沒接 cfg_mshr_entries，見 README）
+    localparam HD  = 8;        // L1-hit 延遲線級數
+    localparam HS  = HD * 2;   // 每級 2 個 slot
+    localparam PQN = 8;        // LSU 請求緩衝深度
+    localparam MQN = 32;       // mem-event side FIFO 深度（>= decode queue 16 + rename）
+
+    // ================= 狀態暫存器 =================
+    // ---- LDQ ----
+    reg [LDN-1:0]      ld_v, ld_ar, ld_st, ld_blk, ld_dn;
+    reg [LDN*6-1:0]    ld_rob, ld_prf;
+    reg [LDN*2-1:0]    ld_lvl;      // MEM_LEVEL
+    reg [LDN*4-1:0]    ld_lc;       // MEM_LAT_CLASS
+    reg [LDN*4-1:0]    ld_wid;      // 卡住這條 load 的 STQ index
+    reg [3:0]          ld_head, ld_tail;
+    reg [4:0]          ld_cnt;
+
+    // ---- STQ ----
+    reg [STN-1:0]      st_v, st_ar, st_st, st_dn, st_noacc;
+    reg [STN*6-1:0]    st_rob, st_prf;
+    reg [3:0]          st_head, st_tail;
+    reg [4:0]          st_cnt;
+
+    // ---- MSHR ----
+    reg [MSN-1:0]      ms_v, ms_dead;
+    reg [MSN*8-1:0]    ms_cnt;
+    reg [MSN*6-1:0]    ms_rob, ms_prf;
+    reg [MSN*4-1:0]    ms_ldq;
+
+    // ---- L1-hit 延遲線（slot s -> stage s>>1）----
+    reg [HS-1:0]       hl_v, hl_q;      // hl_q: 1=STQ 0=LDQ
+    reg [HS*6-1:0]     hl_rob, hl_prf;
+    reg [HS*4-1:0]     hl_idx;
+
+    // ---- LSU 請求緩衝（環狀 FIFO）----
+    reg [PQN*6-1:0]    pq_rob;
+    reg [2:0]          pq_head, pq_tail;
+    reg [3:0]          pq_cnt;
+
+    // ---- mem-event side FIFO：每筆只存 {lat_class[3:0], level[1:0]} = 6 bit ----
+    reg [MQN*6-1:0]    me_q;
+    reg [4:0]          me_head, me_tail;   // MQN=32 -> 指標自然折返
+    reg [5:0]          me_cnt;
+
+    // ---- 決定性偽隨機（store-load disambiguation）----
+    reg [7:0]          la, lb;
+
+    reg [47:0]         stmshr;
+
+    // ================= next-state =================
+    reg [LDN-1:0]      n_ld_v, n_ld_ar, n_ld_st, n_ld_blk, n_ld_dn;
+    reg [LDN*6-1:0]    n_ld_rob, n_ld_prf;
+    reg [LDN*2-1:0]    n_ld_lvl;
+    reg [LDN*4-1:0]    n_ld_lc, n_ld_wid;
+    reg [3:0]          n_ld_head, n_ld_tail;
+    reg [4:0]          n_ld_cnt;
+
+    reg [STN-1:0]      n_st_v, n_st_ar, n_st_st, n_st_dn, n_st_noacc;
+    reg [STN*6-1:0]    n_st_rob, n_st_prf;
+    reg [3:0]          n_st_head, n_st_tail;
+    reg [4:0]          n_st_cnt;
+
+    reg [MSN-1:0]      n_ms_v, n_ms_dead;
+    reg [MSN*8-1:0]    n_ms_cnt;
+    reg [MSN*6-1:0]    n_ms_rob, n_ms_prf;
+    reg [MSN*4-1:0]    n_ms_ldq;
+
+    reg [HS-1:0]       n_hl_v, n_hl_q;
+    reg [HS*6-1:0]     n_hl_rob, n_hl_prf;
+    reg [HS*4-1:0]     n_hl_idx;
+
+    reg [PQN*6-1:0]    n_pq_rob;
+    reg [2:0]          n_pq_head, n_pq_tail;
+    reg [3:0]          n_pq_cnt;
+
+    reg [MQN*6-1:0]    n_me_q;
+    reg [4:0]          n_me_head, n_me_tail;
+    reg [5:0]          n_me_cnt;
+
+    reg [7:0]          n_la, n_lb;
+    reg [47:0]         n_stmshr;
+
+    reg [`W-1:0]       d_v;
+    reg [`W*6-1:0]     d_rob, d_prf;
+
+    assign done_v      = d_v;
+    assign done_rob    = d_rob;
+    assign done_prf    = d_prf;
+    assign cnt_st_mshr = stmshr;
+
+    // ================= 尺寸 mask（runtime）=================
+    wire [4:0] ld_max = (cfg_ldq_entries == 5'd0 || cfg_ldq_entries > 5'd16)
+                        ? 5'd16 : cfg_ldq_entries;
+    wire [4:0] st_max = (cfg_stq_entries == 5'd0 || cfg_stq_entries > 5'd16)
+                        ? 5'd16 : cfg_stq_entries;
+
+    wire [4:0] ld_free = ld_max - ld_cnt;
+    wire [4:0] st_free = st_max - st_cnt;
+
+    // 保守：整組 dispatch（最多 W 條）都放得下才不拉 full
+    // => 要求 cfg_ldq_entries / cfg_stq_entries >= W，見 README
+    assign lsq_full  = (ld_free < `W) | (st_free < `W);
+    assign mshr_full = &ms_v;
+    // be_eu 會把 pop 決定暫存一拍，所以 ready 只在緩衝全空時拉高，
+    // 緩衝深度 PQN=8 足以吸收「ready 慢一拍」造成的 2 個 burst（最大佔用 6）。
+    assign lsu_ready = (pq_cnt == 4'd0);
+
+    // ================= 函式 =================
+    // bstf_lat_table（include/bstf.h），無負載延遲，cycles
+    function [7:0] lat_lut;
+        input [3:0] c;
+        begin
+            if      (c == 4'd0)  lat_lut = 8'd3;
+            else if (c == 4'd1)  lat_lut = 8'd4;
+            else if (c == 4'd2)  lat_lut = 8'd12;
+            else if (c == 4'd3)  lat_lut = 8'd16;
+            else if (c == 4'd4)  lat_lut = 8'd30;
+            else if (c == 4'd5)  lat_lut = 8'd40;
+            else if (c == 4'd6)  lat_lut = 8'd90;
+            else if (c == 4'd7)  lat_lut = 8'd120;
+            else if (c == 4'd8)  lat_lut = 8'd160;
+            else if (c == 4'd9)  lat_lut = 8'd200;
+            else if (c == 4'd10) lat_lut = 8'd2;
+            else if (c == 4'd11) lat_lut = 8'd8;
+            else if (c == 4'd12) lat_lut = 8'd50;
+            else if (c == 4'd13) lat_lut = 8'd70;
+            else if (c == 4'd14) lat_lut = 8'd140;
+            else                 lat_lut = 8'd255;
+        end
+    endfunction
+
+    // 8-bit Fibonacci LFSR，poly x^8+x^6+x^5+x^4+1（最大週期 255）
+    function [7:0] lstep;
+        input [7:0] s;
+        begin
+            lstep = {s[6:0], s[7] ^ s[5] ^ s[4] ^ s[3]};
+        end
+    endfunction
+
+    // ================= 組合邏輯的暫存 =================
+    integer e, m, p, k, s, i, j;
+
+    reg [3:0]  dh;
+    reg        hv_, hd_;
+    reg [1:0]  ndl_ld, ndl_st;
+    reg        sdv0, sdv1;
+    reg [3:0]  sdi0, sdi1;
+    reg [1:0]  nrep;
+    reg        rv0, rv1;
+    reg [3:0]  ri0, ri1;
+    reg        sv0, sv1;
+    reg [5:0]  sr0, sr1;
+    reg [2:0]  ph, pt;
+    reg [1:0]  nsv;
+    reg [2:0]  nacc;
+    reg [3:0]  pcnt;
+
+    reg [1:0]  ngr;
+    reg [1:0]  g_val, g_isld;
+    reg [3:0]  g_idx0, g_idx1;
+    reg [3:0]  g_lc0,  g_lc1;
+    reg [1:0]  g_lvl0, g_lvl1;
+    reg [5:0]  g_rob0, g_rob1, g_prf0, g_prf1;
+
+    reg [3:0]  c_idx, c_lc;
+    reg [1:0]  c_lvl;
+    reg [5:0]  c_rob, c_prf;
+    reg        c_isld;
+    reg [7:0]  c_lat;
+    reg [2:0]  c_tgt;
+    reg        placed, got_ms;
+    reg [3:0]  ms_sel;
+    reg        mshr_stall;
+
+    reg [7:0]  la1, la2, la3, la4;
+    reg [7:0]  lb0, lb1, lb2, lb3, lb4;
+    reg [7:0]  rnd;
+    reg [2:0]  nld_lane;
+    reg [3:0]  a_ldt, a_stt;
+    reg [4:0]  a_ldc, a_stc;
+    // verilator lint_off UNUSEDSIGNAL
+    reg [31:0] u;
+    reg [3:0]  ucls;
+    reg [7:0]  uev;
+    // verilator lint_on UNUSEDSIGNAL
+    reg        is_ld, is_st, is_amo, is_mem;
+    reg [4:0]  mh, mt;
+    reg [2:0]  nmpop, nmpush;
+    reg [5:0]  evq;
+    // verilator lint_off UNUSEDSIGNAL
+    reg [31:0] du;
+    reg [3:0]  dcls;
+    // verilator lint_on UNUSEDSIGNAL
+    reg        ftk;
+    reg        conflict;
+    reg [3:0]  wid_i;
+    reg [4:0]  tmp5;
+
+    // verilator lint_off UNUSED
+    wire [`W*8-1:0] unused_req_ev = req_ev;
+    // verilator lint_on UNUSED
+
+    always @* begin
+        // ---------- 0. 預設：維持現狀 ----------
+        n_ld_v = ld_v; n_ld_ar = ld_ar; n_ld_st = ld_st;
+        n_ld_blk = ld_blk; n_ld_dn = ld_dn;
+        n_ld_rob = ld_rob; n_ld_prf = ld_prf;
+        n_ld_lvl = ld_lvl; n_ld_lc = ld_lc; n_ld_wid = ld_wid;
+        n_ld_head = ld_head; n_ld_tail = ld_tail; n_ld_cnt = ld_cnt;
+
+        n_st_v = st_v; n_st_ar = st_ar; n_st_st = st_st;
+        n_st_dn = st_dn; n_st_noacc = st_noacc;
+        n_st_rob = st_rob; n_st_prf = st_prf;
+        n_st_head = st_head; n_st_tail = st_tail; n_st_cnt = st_cnt;
+
+        n_ms_v = ms_v; n_ms_dead = ms_dead; n_ms_cnt = ms_cnt;
+        n_ms_rob = ms_rob; n_ms_prf = ms_prf; n_ms_ldq = ms_ldq;
+
+        n_hl_v = {HS{1'b0}}; n_hl_q = {HS{1'b0}};
+        n_hl_rob = {HS*6{1'b0}}; n_hl_prf = {HS*6{1'b0}};
+        n_hl_idx = {HS*4{1'b0}};
+
+        n_pq_rob = pq_rob; n_pq_head = pq_head;
+        n_pq_tail = pq_tail; n_pq_cnt = pq_cnt;
+        n_me_q = me_q; n_me_head = me_head;
+        n_me_tail = me_tail; n_me_cnt = me_cnt;
+        n_stmshr = stmshr;
+
+        d_v = {`W{1'b0}}; d_rob = {`W*6{1'b0}}; d_prf = {`W*6{1'b0}};
+
+        mshr_stall = 1'b0;
+        ndl_ld = 2'd0; ndl_st = 2'd0;
+        sdv0 = 1'b0; sdv1 = 1'b0; sdi0 = 4'd0; sdi1 = 4'd0;
+        nrep = 2'd0; ngr = 2'd0;
+        rv0 = 1'b0; rv1 = 1'b0; ri0 = 4'd0; ri1 = 4'd0;
+        sv0 = 1'b0; sv1 = 1'b0; sr0 = 6'd0; sr1 = 6'd0;
+        ph = pq_head; pt = pq_tail; nsv = 2'd0; nacc = 3'd0; pcnt = 4'd0;
+        g_val = 2'b00; g_isld = 2'b00;
+        g_idx0 = 4'd0; g_idx1 = 4'd0; g_lc0 = 4'd0; g_lc1 = 4'd0;
+        g_lvl0 = 2'd0; g_lvl1 = 2'd0;
+        g_rob0 = 6'd0; g_rob1 = 6'd0; g_prf0 = 6'd0; g_prf1 = 6'd0;
+        c_idx = 4'd0; c_lc = 4'd0; c_lvl = 2'd0; c_rob = 6'd0; c_prf = 6'd0;
+        c_isld = 1'b0; c_lat = 8'd0; c_tgt = 3'd0;
+        placed = 1'b0; got_ms = 1'b0; ms_sel = 4'd0;
+        dh = 4'd0; hv_ = 1'b0; hd_ = 1'b0;
+        rnd = 8'd0; nld_lane = 3'd0; conflict = 1'b0; wid_i = 4'd0;
+        u = 32'd0; ucls = 4'd0; uev = 8'd0;
+        is_ld = 1'b0; is_st = 1'b0; is_amo = 1'b0; is_mem = 1'b0; tmp5 = 5'd0;
+        mh = me_head; mt = me_tail; nmpop = 3'd0; nmpush = 3'd0;
+        evq = 6'd0; du = 32'd0; dcls = 4'd0; ftk = 1'b0;
+        a_ldt = 4'd0; a_stt = 4'd0; a_ldc = 5'd0; a_stc = 5'd0;
+        la1 = 8'd0; la2 = 8'd0; la3 = 8'd0; la4 = 8'd0;
+        lb0 = 8'd0; lb1 = 8'd0; lb2 = 8'd0; lb3 = 8'd0; lb4 = 8'd0;
+
+        // ---------- 1. LDQ dealloc（head，最多 2/cycle）----------
+        dh = ld_head;
+        for (k = 0; k < 2; k = k + 1) begin
+            hv_ = 1'b0; hd_ = 1'b0;
+            for (e = 0; e < LDN; e = e + 1)
+                if (e[3:0] == dh) begin hv_ = n_ld_v[e]; hd_ = n_ld_dn[e]; end
+            if (hv_ & hd_) begin
+                for (e = 0; e < LDN; e = e + 1)
+                    if (e[3:0] == dh) begin
+                        n_ld_v[e]   = 1'b0; n_ld_ar[e]  = 1'b0;
+                        n_ld_st[e]  = 1'b0; n_ld_dn[e]  = 1'b0;
+                        n_ld_blk[e] = 1'b0;
+                    end
+                ndl_ld = ndl_ld + 2'd1;
+                tmp5 = {1'b0, dh} + 5'd1;
+                if (tmp5 >= ld_max) dh = 4'd0; else dh = tmp5[3:0];
+            end
+        end
+        n_ld_head = dh;
+        n_ld_cnt  = ld_cnt - {3'b000, ndl_ld};
+
+        // ---------- 2. STQ dealloc（store commit / store buffer drain 代理）----
+        dh = st_head;
+        for (k = 0; k < 2; k = k + 1) begin
+            hv_ = 1'b0; hd_ = 1'b0;
+            for (e = 0; e < STN; e = e + 1)
+                if (e[3:0] == dh) begin hv_ = n_st_v[e]; hd_ = n_st_dn[e]; end
+            if (hv_ & hd_) begin
+                for (e = 0; e < STN; e = e + 1)
+                    if (e[3:0] == dh) begin
+                        n_st_v[e]     = 1'b0; n_st_ar[e] = 1'b0;
+                        n_st_st[e]    = 1'b0; n_st_dn[e] = 1'b0;
+                        n_st_noacc[e] = 1'b0;
+                    end
+                if (k == 0) begin sdv0 = 1'b1; sdi0 = dh; end
+                else        begin sdv1 = 1'b1; sdi1 = dh; end
+                ndl_st = ndl_st + 2'd1;
+                tmp5 = {1'b0, dh} + 5'd1;
+                if (tmp5 >= st_max) dh = 4'd0; else dh = tmp5[3:0];
+            end
+        end
+        n_st_head = dh;
+        n_st_cnt  = st_cnt - {3'b000, ndl_st};
+
+        // ---------- 3. 解除 store-load 衝突封鎖 ----------
+        for (e = 0; e < LDN; e = e + 1)
+            if (n_ld_blk[e] &
+                ((sdv0 & (n_ld_wid[e*4 +: 4] == sdi0)) |
+                 (sdv1 & (n_ld_wid[e*4 +: 4] == sdi1))))
+                n_ld_blk[e] = 1'b0;
+
+        // ---------- 4. 延遲線 stage0 完成 → done lane 0/1 ----------
+        for (s = 0; s < 2; s = s + 1)
+            if (hl_v[s]) begin
+                d_v[s] = 1'b1;
+                d_rob[s*6 +: 6] = hl_rob[s*6 +: 6];
+                d_prf[s*6 +: 6] = hl_prf[s*6 +: 6];
+                if (hl_q[s]) begin
+                    for (e = 0; e < STN; e = e + 1)
+                        if (e[3:0] == hl_idx[s*4 +: 4]) n_st_dn[e] = 1'b1;
+                end else begin
+                    for (e = 0; e < LDN; e = e + 1)
+                        if (e[3:0] == hl_idx[s*4 +: 4]) n_ld_dn[e] = 1'b1;
+                end
+            end
+
+        // ---------- 5. 延遲線移位（stage k <= stage k+1）----------
+        for (s = 0; s < HS - 2; s = s + 1) begin
+            n_hl_v[s]          = hl_v[s+2];
+            n_hl_q[s]          = hl_q[s+2];
+            n_hl_rob[s*6 +: 6] = hl_rob[(s+2)*6 +: 6];
+            n_hl_prf[s*6 +: 6] = hl_prf[(s+2)*6 +: 6];
+            n_hl_idx[s*4 +: 4] = hl_idx[(s+2)*4 +: 4];
+        end
+
+        // ---------- 6. MSHR 倒數 + 完成回報（done lane 2/3，最多 2/cycle）----
+        for (m = 0; m < MSN; m = m + 1) begin
+            if (ms_v[m]) begin
+                if (ms_cnt[m*8 +: 8] != 8'd0) begin
+                    n_ms_cnt[m*8 +: 8] = ms_cnt[m*8 +: 8] - 8'd1;
+                end else if (ms_dead[m]) begin
+                    // flush 之後的 wrong-path miss：照樣佔著 MSHR 倒數完，
+                    // 但不回報（pipeline 其他級在 flush 時已經整組清空）
+                    n_ms_v[m]    = 1'b0;
+                    n_ms_dead[m] = 1'b0;
+                end else if (nrep < 2'd2) begin
+                    if (nrep == 2'd0) begin
+                        d_v[2] = 1'b1;
+                        d_rob[2*6 +: 6] = ms_rob[m*6 +: 6];
+                        d_prf[2*6 +: 6] = ms_prf[m*6 +: 6];
+                        rv0 = 1'b1; ri0 = ms_ldq[m*4 +: 4];
+                    end else begin
+                        d_v[3] = 1'b1;
+                        d_rob[3*6 +: 6] = ms_rob[m*6 +: 6];
+                        d_prf[3*6 +: 6] = ms_prf[m*6 +: 6];
+                        rv1 = 1'b1; ri1 = ms_ldq[m*4 +: 4];
+                    end
+                    n_ms_v[m] = 1'b0;
+                    nrep = nrep + 2'd1;
+                end
+            end
+        end
+        // 只對真正回報的（最多 2 個）做一次 LDQ index 解碼
+        for (e = 0; e < LDN; e = e + 1)
+            if ((rv0 & (e[3:0] == ri0)) | (rv1 & (e[3:0] == ri1)))
+                n_ld_dn[e] = 1'b1;
+
+        // ---------- 7. 請求緩衝：送 2 個進 rob CAM，設 address-ready ----------
+        if (pq_cnt > 4'd0) begin
+            sv0 = 1'b1;
+            for (j = 0; j < PQN; j = j + 1)
+                if (j[2:0] == ph) sr0 = pq_rob[j*6 +: 6];
+            ph = ph + 3'd1; nsv = 2'd1;
+        end
+        if (pq_cnt > 4'd1) begin
+            sv1 = 1'b1;
+            for (j = 0; j < PQN; j = j + 1)
+                if (j[2:0] == ph) sr1 = pq_rob[j*6 +: 6];
+            ph = ph + 3'd1; nsv = 2'd2;
+        end
+        n_pq_head = ph;
+
+        for (e = 0; e < LDN; e = e + 1)
+            if (n_ld_v[e] & ~n_ld_ar[e] &
+                ((sv0 & (n_ld_rob[e*6 +: 6] == sr0)) |
+                 (sv1 & (n_ld_rob[e*6 +: 6] == sr1))))
+                n_ld_ar[e] = 1'b1;
+        for (e = 0; e < STN; e = e + 1)
+            if (n_st_v[e] & ~n_st_ar[e] &
+                ((sv0 & (n_st_rob[e*6 +: 6] == sr0)) |
+                 (sv1 & (n_st_rob[e*6 +: 6] == sr1))))
+                n_st_ar[e] = 1'b1;
+
+        // ---------- 8a. 記憶體埠仲裁：最多 2 個存取 / cycle（load 優先）------
+        for (e = 0; e < LDN; e = e + 1)
+            if ((ngr < 2'd2) & n_ld_v[e] & n_ld_ar[e] &
+                ~n_ld_st[e] & ~n_ld_blk[e] & ~n_ld_dn[e]) begin
+                if (ngr == 2'd0) begin
+                    g_val[0] = 1'b1; g_isld[0] = 1'b1; g_idx0 = e[3:0];
+                    g_lc0  = n_ld_lc[e*4 +: 4];  g_lvl0 = n_ld_lvl[e*2 +: 2];
+                    g_rob0 = n_ld_rob[e*6 +: 6]; g_prf0 = n_ld_prf[e*6 +: 6];
+                end else begin
+                    g_val[1] = 1'b1; g_isld[1] = 1'b1; g_idx1 = e[3:0];
+                    g_lc1  = n_ld_lc[e*4 +: 4];  g_lvl1 = n_ld_lvl[e*2 +: 2];
+                    g_rob1 = n_ld_rob[e*6 +: 6]; g_prf1 = n_ld_prf[e*6 +: 6];
+                end
+                ngr = ngr + 2'd1;
+            end
+        for (e = 0; e < STN; e = e + 1)
+            if ((ngr < 2'd2) & n_st_v[e] & n_st_ar[e] &
+                ~n_st_st[e] & ~n_st_dn[e] & ~n_st_noacc[e]) begin
+                if (ngr == 2'd0) begin
+                    g_val[0] = 1'b1; g_isld[0] = 1'b0; g_idx0 = e[3:0];
+                    g_lc0 = 4'd10; g_lvl0 = 2'd0;
+                    g_rob0 = n_st_rob[e*6 +: 6]; g_prf0 = n_st_prf[e*6 +: 6];
+                end else begin
+                    g_val[1] = 1'b1; g_isld[1] = 1'b0; g_idx1 = e[3:0];
+                    g_lc1 = 4'd10; g_lvl1 = 2'd0;
+                    g_rob1 = n_st_rob[e*6 +: 6]; g_prf1 = n_st_prf[e*6 +: 6];
+                end
+                ngr = ngr + 2'd1;
+            end
+
+        // ---------- 8b. 發動存取：L1 hit 走延遲線，miss 一定要配 MSHR ----------
+        for (p = 0; p < 2; p = p + 1) begin
+            if (g_val[p]) begin
+                if (p == 0) begin
+                    c_idx = g_idx0; c_lc = g_lc0; c_lvl = g_lvl0;
+                    c_rob = g_rob0; c_prf = g_prf0; c_isld = g_isld[0];
+                end else begin
+                    c_idx = g_idx1; c_lc = g_lc1; c_lvl = g_lvl1;
+                    c_rob = g_rob1; c_prf = g_prf1; c_isld = g_isld[1];
+                end
+                if (c_isld) c_lat = lat_lut(c_lc);
+                else        c_lat = ST_LAT[7:0];
+
+                if (c_isld & (c_lvl != 2'd0)) begin
+                    // ---- miss ----
+                    got_ms = 1'b0; ms_sel = 4'd0;
+                    for (m = 0; m < MSN; m = m + 1)
+                        if (~got_ms & ~n_ms_v[m]) begin
+                            got_ms = 1'b1; ms_sel = m[3:0];
+                        end
+                    if (got_ms) begin
+                        for (m = 0; m < MSN; m = m + 1)
+                            if (m[3:0] == ms_sel) begin
+                                n_ms_v[m]          = 1'b1;
+                                n_ms_dead[m]       = 1'b0;
+                                n_ms_cnt[m*8 +: 8] = c_lat;
+                                n_ms_rob[m*6 +: 6] = c_rob;
+                                n_ms_prf[m*6 +: 6] = c_prf;
+                                n_ms_ldq[m*4 +: 4] = c_idx;
+                            end
+                        for (e = 0; e < LDN; e = e + 1)
+                            if (e[3:0] == c_idx) n_ld_st[e] = 1'b1;
+                    end else begin
+                        // MSHR 滿 → 這個 miss 卡住，下一拍重試（MLP 上限）
+                        mshr_stall = 1'b1;
+                    end
+                end else begin
+                    // ---- L1 hit / store：固定延遲，走延遲線 ----
+                    if (c_lat == 8'd0)     c_tgt = 3'd0;
+                    else if (c_lat > 8'd8) c_tgt = 3'd7;
+                    else                   c_tgt = c_lat[2:0] - 3'd1;
+                    placed = 1'b0;
+                    for (s = 0; s < HS; s = s + 1)
+                        if (~placed & (s[3:1] == c_tgt) & ~n_hl_v[s]) begin
+                            n_hl_v[s]          = 1'b1;
+                            n_hl_q[s]          = ~c_isld;
+                            n_hl_rob[s*6 +: 6] = c_rob;
+                            n_hl_prf[s*6 +: 6] = c_prf;
+                            n_hl_idx[s*4 +: 4] = c_idx;
+                            placed = 1'b1;
+                        end
+                    if (placed) begin
+                        if (c_isld) begin
+                            for (e = 0; e < LDN; e = e + 1)
+                                if (e[3:0] == c_idx) n_ld_st[e] = 1'b1;
+                        end else begin
+                            for (e = 0; e < STN; e = e + 1)
+                                if (e[3:0] == c_idx) n_st_st[e] = 1'b1;
+                        end
+                    end
+                end
+            end
+        end
+
+        // ---------- 9. 收新的 LSU 請求（每拍最多 W 個）----------
+        pcnt = pq_cnt - {2'b00, nsv};
+        for (i = 0; i < `W; i = i + 1)
+            if (req_v[i] & ((pcnt + {1'b0, nacc}) < PQN[3:0])) begin
+                for (j = 0; j < PQN; j = j + 1)
+                    if (j[2:0] == pt) n_pq_rob[j*6 +: 6] = req_rob[i*`ROB_W +: 6];
+                pt   = pt + 3'd1;
+                nacc = nacc + 3'd1;
+            end
+        n_pq_tail = pt;
+        n_pq_cnt  = pcnt + {1'b0, nacc};
+
+        // ---------- 10. dispatch 配置 LDQ / STQ ----------
+        la1 = lstep(la);  la2 = lstep(la1); la3 = lstep(la2); la4 = lstep(la3);
+        lb0 = lb;         lb1 = lstep(lb0); lb2 = lstep(lb1);
+        lb3 = lstep(lb2); lb4 = lstep(lb3);
+
+        a_ldt = n_ld_tail; a_stt = n_st_tail;
+        a_ldc = n_ld_cnt;  a_stc = n_st_cnt;
+
+        for (i = 0; i < `W; i = i + 1) begin
+            u    = ds_ruop[i*`RUOP_W +: `RUOP_W];
+            ucls = u[`RUOP_CLASS];
+            is_amo = ds_valid[i] & ~flush & (ucls == `UC_AMO);
+            is_ld  = (ds_valid[i] & ~flush & (ucls == `UC_LOAD))  | is_amo;
+            is_st  = (ds_valid[i] & ~flush & (ucls == `UC_STORE)) | is_amo;
+            is_mem = is_ld | is_st;          // AMO 只算一筆 mem access
+
+            // ---- 從 side FIFO 取出這條 mem uop 的 cache 事件 ----
+            evq = 6'd0;
+            if (is_mem & ({3'b000, nmpop} < me_cnt)) begin
+                for (j = 0; j < MQN; j = j + 1)
+                    if (j[4:0] == mh) evq = me_q[j*6 +: 6];
+                mh    = mh + 5'd1;
+                nmpop = nmpop + 3'd1;
+            end
+            uev = {evq[5:2], 2'b00, evq[1:0]};   // {lat_class, -, level}
+
+            // ---- STQ 先配（同一拍的 store 不算自己的 hazard）----
+            if (is_st & (a_stc < st_max)) begin
+                for (e = 0; e < STN; e = e + 1)
+                    if (e[3:0] == a_stt) begin
+                        n_st_v[e]  = 1'b1;
+                        n_st_ar[e] = 1'b0;
+                        n_st_st[e] = 1'b0;
+                        n_st_rob[e*6 +: 6] = ds_robidx[i*`ROB_W +: 6];
+                        n_st_prf[e*6 +: 6] = u[`RUOP_D];
+                        // AMO 的 STQ entry 只是排序佔位：不佔埠、不回報 done
+                        n_st_noacc[e] = is_amo;
+                        n_st_dn[e]    = is_amo;
+                    end
+                tmp5 = {1'b0, a_stt} + 5'd1;
+                if (tmp5 >= st_max) a_stt = 4'd0; else a_stt = tmp5[3:0];
+                a_stc = a_stc + 5'd1;
+            end
+
+            // ---- LDQ ----
+            if (is_ld & (a_ldc < ld_max)) begin
+                // 決定性偽隨機：rnd < CONF_THR 且有更早未完成的 store → 衝突
+                if      (i == 0) rnd = la1 ^ lb0;
+                else if (i == 1) rnd = la2 ^ lb0;
+                else if (i == 2) rnd = la3 ^ lb0;
+                else             rnd = la4 ^ lb0;
+                // STQ 裡最年輕的 store（= a_stt - 1）一定比這條 load 老
+                if (a_stt == 4'd0) wid_i = st_max[3:0] - 4'd1;
+                else               wid_i = a_stt - 4'd1;
+                conflict = (rnd < CONF_THR) & (a_stc != 5'd0);
+
+                for (e = 0; e < LDN; e = e + 1)
+                    if (e[3:0] == a_ldt) begin
+                        n_ld_v[e]   = 1'b1;
+                        n_ld_ar[e]  = 1'b0;
+                        n_ld_st[e]  = 1'b0;
+                        n_ld_dn[e]  = 1'b0;
+                        n_ld_blk[e] = conflict;
+                        n_ld_wid[e*4 +: 4] = wid_i;
+                        n_ld_rob[e*6 +: 6] = ds_robidx[i*`ROB_W +: 6];
+                        n_ld_prf[e*6 +: 6] = u[`RUOP_D];
+                        n_ld_lvl[e*2 +: 2] = uev[1:0];      // MEM_LEVEL
+                        n_ld_lc[e*4 +: 4]  = uev[7:4];      // MEM_LAT_CLASS
+                    end
+                tmp5 = {1'b0, a_ldt} + 5'd1;
+                if (tmp5 >= ld_max) a_ldt = 4'd0; else a_ldt = tmp5[3:0];
+                a_ldc = a_ldc + 5'd1;
+                nld_lane = nld_lane + 3'd1;
+            end
+        end
+        n_ld_tail = a_ldt; n_ld_cnt = a_ldc;
+        n_st_tail = a_stt; n_st_cnt = a_stc;
+        n_me_head = mh;
+
+        // ---- mem-event side FIFO：fetch 當拍實際被取走的 mem uop 推進來 ----
+        for (i = 0; i < `W; i = i + 1) begin
+            du   = fb_duop[i*`DUOP_W +: `DUOP_W];
+            dcls = du[`DUOP_CLASS];
+            ftk  = fb_valid[i] & (i[2:0] < fb_take);
+            if (ftk & ((dcls == `UC_LOAD) | (dcls == `UC_STORE) | (dcls == `UC_AMO))
+                    & ((me_cnt - {3'b000, nmpop} + {3'b000, nmpush}) < MQN[5:0])) begin
+                for (j = 0; j < MQN; j = j + 1)
+                    if (j[4:0] == mt)
+                        n_me_q[j*6 +: 6] = {fb_mem_event[i*8+4 +: 4],
+                                            fb_mem_event[i*8 +: 2]};
+                mt     = mt + 5'd1;
+                nmpush = nmpush + 3'd1;
+            end
+        end
+        n_me_tail = mt;
+        n_me_cnt  = me_cnt - {3'b000, nmpop} + {3'b000, nmpush};
+
+        // LFSR：la 每拍 4 步，lb 每配一條 load 1 步（兩者相位錯開 → 長週期）
+        n_la = la4;
+        if      (nld_lane == 3'd0) n_lb = lb0;
+        else if (nld_lane == 3'd1) n_lb = lb1;
+        else if (nld_lane == 3'd2) n_lb = lb2;
+        else if (nld_lane == 3'd3) n_lb = lb3;
+        else                       n_lb = lb4;
+
+        // ---------- 11. flush：LSQ / 延遲線 / 請求緩衝整組清空 ----------
+        // （be_eu、be_dispatch 在 flush 時也是整組清空，語意一致）
+        // MSHR 例外：已經送出去的 miss 收不回來，改標 dead 繼續倒數，
+        // 佔著 MSHR 但不回報 —— 這樣才保得住 wrong-path 的 MSHR 污染效應。
+        if (flush) begin
+            n_ld_v = {LDN{1'b0}}; n_ld_ar = {LDN{1'b0}}; n_ld_st = {LDN{1'b0}};
+            n_ld_blk = {LDN{1'b0}}; n_ld_dn = {LDN{1'b0}};
+            n_ld_head = 4'd0; n_ld_tail = 4'd0; n_ld_cnt = 5'd0;
+
+            n_st_v = {STN{1'b0}}; n_st_ar = {STN{1'b0}}; n_st_st = {STN{1'b0}};
+            n_st_dn = {STN{1'b0}}; n_st_noacc = {STN{1'b0}};
+            n_st_head = 4'd0; n_st_tail = 4'd0; n_st_cnt = 5'd0;
+
+            n_hl_v = {HS{1'b0}};
+            n_pq_head = 3'd0; n_pq_tail = 3'd0; n_pq_cnt = 4'd0;
+            // wrong-path 的 mem event 一律丟掉（runtime 會把 .mem 游標倒回）
+            n_me_head = 5'd0; n_me_tail = 5'd0; n_me_cnt = 6'd0;
+            n_ms_dead = n_ms_dead | n_ms_v;
+            d_v = {`W{1'b0}};
+        end
+
+        // ---------- 12. counter ----------
+        if (mshr_stall) n_stmshr = stmshr + 48'd1;
+    end
+
+    // ================= 同步更新 =================
+    always @(posedge clk) begin
+        if (rst) begin
+            ld_v <= {LDN{1'b0}}; ld_ar <= {LDN{1'b0}}; ld_st <= {LDN{1'b0}};
+            ld_blk <= {LDN{1'b0}}; ld_dn <= {LDN{1'b0}};
+            ld_rob <= {LDN*6{1'b0}}; ld_prf <= {LDN*6{1'b0}};
+            ld_lvl <= {LDN*2{1'b0}}; ld_lc <= {LDN*4{1'b0}};
+            ld_wid <= {LDN*4{1'b0}};
+            ld_head <= 4'd0; ld_tail <= 4'd0; ld_cnt <= 5'd0;
+
+            st_v <= {STN{1'b0}}; st_ar <= {STN{1'b0}}; st_st <= {STN{1'b0}};
+            st_dn <= {STN{1'b0}}; st_noacc <= {STN{1'b0}};
+            st_rob <= {STN*6{1'b0}}; st_prf <= {STN*6{1'b0}};
+            st_head <= 4'd0; st_tail <= 4'd0; st_cnt <= 5'd0;
+
+            ms_v <= {MSN{1'b0}}; ms_dead <= {MSN{1'b0}};
+            ms_cnt <= {MSN*8{1'b0}};
+            ms_rob <= {MSN*6{1'b0}}; ms_prf <= {MSN*6{1'b0}};
+            ms_ldq <= {MSN*4{1'b0}};
+
+            hl_v <= {HS{1'b0}}; hl_q <= {HS{1'b0}};
+            hl_rob <= {HS*6{1'b0}}; hl_prf <= {HS*6{1'b0}};
+            hl_idx <= {HS*4{1'b0}};
+
+            pq_rob <= {PQN*6{1'b0}};
+            pq_head <= 3'd0; pq_tail <= 3'd0; pq_cnt <= 4'd0;
+
+            me_q <= {MQN*6{1'b0}};
+            me_head <= 5'd0; me_tail <= 5'd0; me_cnt <= 6'd0;
+
+            la <= 8'hA5; lb <= 8'h3C;
+            stmshr <= 48'd0;
+        end else begin
+            ld_v <= n_ld_v; ld_ar <= n_ld_ar; ld_st <= n_ld_st;
+            ld_blk <= n_ld_blk; ld_dn <= n_ld_dn;
+            ld_rob <= n_ld_rob; ld_prf <= n_ld_prf;
+            ld_lvl <= n_ld_lvl; ld_lc <= n_ld_lc; ld_wid <= n_ld_wid;
+            ld_head <= n_ld_head; ld_tail <= n_ld_tail; ld_cnt <= n_ld_cnt;
+
+            st_v <= n_st_v; st_ar <= n_st_ar; st_st <= n_st_st;
+            st_dn <= n_st_dn; st_noacc <= n_st_noacc;
+            st_rob <= n_st_rob; st_prf <= n_st_prf;
+            st_head <= n_st_head; st_tail <= n_st_tail; st_cnt <= n_st_cnt;
+
+            ms_v <= n_ms_v; ms_dead <= n_ms_dead; ms_cnt <= n_ms_cnt;
+            ms_rob <= n_ms_rob; ms_prf <= n_ms_prf; ms_ldq <= n_ms_ldq;
+
+            hl_v <= n_hl_v; hl_q <= n_hl_q;
+            hl_rob <= n_hl_rob; hl_prf <= n_hl_prf; hl_idx <= n_hl_idx;
+
+            pq_rob <= n_pq_rob;
+            pq_head <= n_pq_head; pq_tail <= n_pq_tail; pq_cnt <= n_pq_cnt;
+
+            me_q <= n_me_q;
+            me_head <= n_me_head; me_tail <= n_me_tail; me_cnt <= n_me_cnt;
+
+            la <= n_la; lb <= n_lb;
+            stmshr <= n_stmshr;
+        end
+    end
+endmodule

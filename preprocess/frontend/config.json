@@ -1,0 +1,33 @@
+{
+  "//": "BSTM 離線前端模擬器預設配置（CONTRACT.md §0 的 demo 規格）",
+
+  "ubtb_entries":    16,
+  "ubtb_tag_bits":   20,
+
+  "btb_entries":     8192,
+  "btb_ways":        4,
+
+  "tage_tables": [
+    {"hist":  8, "entries": 1024, "tag_bits": 8, "ctr_bits": 3, "u_bits": 2},
+    {"hist": 16, "entries": 1024, "tag_bits": 8, "ctr_bits": 3, "u_bits": 2},
+    {"hist": 32, "entries": 1024, "tag_bits": 8, "ctr_bits": 3, "u_bits": 2},
+    {"hist": 64, "entries": 1024, "tag_bits": 8, "ctr_bits": 3, "u_bits": 2}
+  ],
+  "bimodal_index_bits":  13,
+  "bimodal_ctr_bits":    2,
+  "useful_reset_period": 262144,
+  "use_alt_on_na":       1,
+
+  "ras_depth":       16,
+
+  "btb_dir_hint":    1,
+
+  "wrongpath_depth": 10,
+  "wrongpath_out":   "separate",
+  "wrongpath_train_btb":  1,
+  "wrongpath_train_tage": 0,
+
+  "fetch_width":     4,
+  "ilen_bytes":      4,
+  "max_blk_instr":   8
+}

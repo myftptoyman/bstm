@@ -1,0 +1,29 @@
+{
+  // BSTM demo baseline memory hierarchy.
+  // Sizes in bytes.  size/(ways*line_size) must be a power of two.
+  "line_size": 64,
+  "page_size": 4096,
+
+  "l1i": { "size": 32768,   "ways": 8 },
+  "l1d": { "size": 32768,   "ways": 8 },
+  "l2":  { "size": 524288,  "ways": 8, "inclusive": true },
+  "l3":  { "size": 4194304, "ways": 16, "enabled": true },
+
+  "itlb": { "entries": 32 },
+  "dtlb": { "entries": 64 },
+
+  "prefetcher": {
+    "enabled": true,
+    "entries": 64,
+    "degree": 2,
+    "distance": 1,
+    "min_conf": 2,
+    "index": "pc"          // "pc" (needs the optional pc column) or "page"
+  },
+
+  // indices into bstf_lat_table[] in include/bstf.h
+  "latency_class": {
+    "l1": 0, "l2": 2, "l3": 4, "dram": 6, "prefetch": 11, "store_hit": 0
+  },
+  "tlb_miss_bump_class": false
+}

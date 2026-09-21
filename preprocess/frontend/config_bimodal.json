@@ -1,0 +1,11 @@
+{
+  "//": "對照組：拿掉所有 tagged component，只剩 bimodal（用來確認 TAGE 真的有用）",
+  "ubtb_entries": 16,
+  "btb_entries": 8192,
+  "btb_ways": 4,
+  "tage_tables": [],
+  "bimodal_index_bits": 13,
+  "ras_depth": 16,
+  "wrongpath_depth": 10,
+  "fetch_width": 4
+}

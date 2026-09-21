@@ -1,0 +1,10 @@
+{
+  "//": "同 config.json，但關掉 wrong-path 展開（對照組）",
+  "ubtb_entries": 16,
+  "btb_entries": 8192,
+  "btb_ways": 4,
+  "tage_tables": [8, 16, 32, 64],
+  "ras_depth": 16,
+  "wrongpath_depth": 0,
+  "fetch_width": 4
+}
