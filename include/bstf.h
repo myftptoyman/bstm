@@ -41,7 +41,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  rsvd0     : 3;
     uint16_t fe_index_delta;  /* 相對於上一筆的 fetch-block 序號增量 (0 或 1) */
     uint16_t mem_index_delta; /* 相對於上一筆的 mem-access 序號增量 (0 或 1) */
-    uint32_t shadow_off;      /* wrong-path shadow 的「位元組」偏移；0 = 無 */
+    uint32_t shadow_off;      /* wrong-path shadow 的「絕對檔案位元組偏移」；0 = 無。
+                                 【已知上限】uint32 在 50M trace 時，correct-path 區就佔
+                                 800 MB，只剩 K≈349 的餘裕；200M 指令的 trace 在任何 K 下
+                                 都會溢位。產生端（bstf_gen）已加硬性失敗而非靜默 wrap。
+                                 修法：改成相對於 hdr.shadow_offset（餘裕 ×5）。
+                                 【尚未實作】—— 資料與 reader 目前都是絕對偏移。*/
     uint16_t shadow_len;      /* shadow 指令數 */
 } bstf_rec_t;                 /* v2 修正：移除 rsvd1，現在真的是 16 bytes（H 發現原本是 18）。
                                  讀取仍應以 hdr.rec_bytes 為準，不要用 sizeof()。 */
@@ -57,7 +62,12 @@ typedef struct __attribute__((packed)) {
 /* v2 A3 裁決：FE_BUBBLES==3 保留給「≥3 拍」或 I-cache miss 造成的 fetch bubble，
    目前離線前端模擬器不會產生，timing model 應視為 3 拍以上（飽和）。      */
 /* v2 A1 裁決：.fe 只含 correct-path，線性、每 block 一 byte、游標可直接累加。
-   wrong-path 另寫 <out>.fe.wp：第 k 次誤預測對應 byte 區間 [k*D, (k+1)*D)。 */
+   wrong-path 另寫 <out>.fe.wp：第 k 次誤預測對應 byte 區間 [k*D, (k+1)*D)。
+   v9 §19：D 的單位是 **fetch block** 不是指令（FE_* 是 block 層級屬性）。
+   四種 overlay 三種粒度，不可互推：
+     .fe / .fe.wp  每個 fetch block 一 byte
+     .mem          每個 data 存取一 byte
+     base .bstf    每條指令 16 byte                                   */
 /* v2 B2 裁決：.mem 只含 data 存取（load/store/AMO），對應 mem_index_delta。
    instruction fetch 另寫 .imem（每 fetch block 一 byte）。demo 不接線。   */
 

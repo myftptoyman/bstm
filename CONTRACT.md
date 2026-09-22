@@ -336,3 +336,274 @@ gate 只 +10.6%，而且連 ROB=64 的 IPC 都從 1.391 → 1.439（+3.5%）—�
 舊的重新排程路徑本來就在偷吃效能。
 
 > **能讓失效在結構上不可能發生時，不要只是把容量加大。**
+
+
+## v8（2026-09-22）— ready 改成 partial accept
+
+### 動機（實測，非推測）
+
+診斷 counter 在真 CoreMark trace 上量到：
+
+```
+lsq_full 總拍數        118,331
+  真滿（一格都沒有）        30    ←  0.03%
+  假滿（還有 1~3 格）  118,301    ← 99.97%
+  真+假 == cnt_st_lsq           ✓ 守恆
+
+LDQ 平均佔用 7.17/16 (45%)   STQ 平均佔用 2.24/16 (14%)
+```
+
+**LSQ 報滿的拍次裡 99.97% 是 all-or-nothing 協定造成的假 stall**，佔總 cycle 的 23.7%。
+加 LDQ/STQ entry 只能救那 30 拍。
+
+### §6 v2 協定（取代原本的 all-or-nothing）
+
+```verilog
+// 舊：單 bit，all-or-nothing
+output wire                  xx_ready;      // 0 → 一條都不可送
+
+// 新：可接受的條數
+output wire [2:0]            xx_nready;     // 0..`W，「我這拍能收前 N 條」
+```
+
+**規則：**
+
+1. **依序接受**：下游接受的一定是 bundle 裡**最前面的 `n` 條**，不可跳號
+   （跳號會破壞程式順序，而 ROB/LSQ 的配置依賴它）。
+2. **`nready` 不得依賴 `valid`** —— 只能看下游自己的狀態（空位數）。
+   這是避免 valid↔ready 組合迴圈的硬性要求（Agent D 在 v1 已指出）。
+3. **上游必須保留未被接受的 uop，依序重送**，且 `valid` 不得因 `nready` 變小而撤回。
+4. 送出數 = `min(popcount(valid_in_order), nready)`。
+
+### §8 v2 stall 歸因（partial accept 下的修訂）
+
+原本「每個 stall cycle 恰好一個來源」在 partial accept 下不夠用 ——
+一拍可能「收了 2 條、擋了 2 條」，既不是完全 stall 也不是完全通過。
+
+**新定義（兩個互補的量，不可互相取代）：**
+
+```verilog
+output wire [47:0] cnt_st_XX;        // nready == 0 且有東西要送 → 完全停擺的拍數
+output wire [47:0] cnt_lost_XX;      // Σ (想送的條數 − 實際送出的條數) → 損失的 uop-slot
+```
+
+- `cnt_st_XX` 保留原本的「拍數」語意，仍須互斥、可加總
+- `cnt_lost_XX` 是**吞吐損失**的直接度量，單位是 uop 不是 cycle
+- 兩者都要報。只看 `cnt_st` 會低估 partial 的代價，只看 `cnt_lost` 會看不出完全停擺
+
+### 預期效果（待驗證）
+
+- 消除 LSQ 的 118,301 拍假 stall（23.7% 的總 cycle）
+- 消除 `cnt_st_iq` 裡「剩 1~3 格也算滿」的同類灌水
+- **`cfg_*` 的下限可以回到 1**（v7.1 因 all-or-nothing 被迫改成 `` `W ``）
+- ROB 的同類門檻效應
+
+### 風險
+
+- **組合迴圈**：`nready` 依賴 `valid` 會立刻形成迴圈。規則 2 是硬性的。
+- **partial 之後的順序**：上游保留未送出的 uop 時，必須維持程式順序且不可重排。
+- **bundle 內相依**：rename 的 bundle 內 RAW/WAW 旁路原本假設整組一起送，
+  partial 之後前半送出、後半保留，下一拍的旁路來源改變 —— 這是最容易出錯的地方。
+
+## v8.1（2026-09-22）— Agent F 的兩項糾正
+
+### (1) `lsq_nfree = min(ld_free, st_free, `W)` 不是保守值，是**緊界**
+
+監督者原本把它描述成「簡單但 3 load + 1 store 時會低估」。**錯。**
+
+一條記憶體 uop 可能要 LDQ（load）、要 STQ（store）、或 **兩者都要（AMO）**。
+所以長度 N 的前綴最壞會吃掉 N 個 LDQ **且** N 個 STQ。
+任何 `N > min(ld_free, st_free)` 的承諾都能被「N 條全 load」或「N 條全 store」打爆
+→ 違反規則 1（依序接受不可跳號）。
+
+**在「不得窺探 bundle 組成」的前提下，(a) 已經是可能的最大值。**
+
+要更精確只能讓 rename 額外送出兩個 `` `W ``-bit 的**類別遮罩**
+（每 lane「是不是 load」「是不是 store」），且**獨立於 `valid`** ——
+那樣 `nfree` 依賴「組成」而非「有效」，規則 2 仍成立、無迴圈。
+實測收益：cfg=16 時只多救 32 個 uop-slot（不值得），
+但 **ROB=128 時 `lost` 跳到 4,680，(b) 可多救 2,267（≥48%）** —— 屆時值得做。
+
+### (2) STQ 佔用偏低有一部分是**模型簡化**，不是 workload 性質
+
+監督者從 LDQ 45% / STQ 14% 的實測推論「16/16 對稱配置浪費，STQ 8 格就夠」。
+**這個推論不安全。**
+
+`lsu_q` 的 store 一律當 store-buffer hit（`ST_LAT=2`、不配 MSHR），
+所以 STQ entry 只佔 2~3 拍就排掉，**自然偏空**。
+
+> **掃 STQ 大小之前，必須先讓 store 也吃 `MEM_LEVEL`（write-allocate），
+> 否則量到的是模型簡化的產物而不是設計取捨。**
+
+這與 §7.1(3)「耦合維度會產生假的平坦曲線」是同一類陷阱的另一種形式：
+**曲線平坦可能是因為那個維度被模型簡化架空了。**
+
+## v8.2（2026-09-22）— Agent D 的三項發現
+
+### (1) 規則 1 讓 bundle 旁路問題自動消失
+
+監督者把「bundle 內 RAW/WAW 旁路」標為 partial accept 最難的部分。**它是免費的。**
+
+規則 1（依序接受、不可跳號）保證 `lane j 被接受 ⇒ 所有 i<j 也被接受`。
+而旁路只會「lane j 旁路自 lane i<j」。
+→ **每個被接受的 lane，它的旁路來源必定也被接受**
+→ 旁路網路對前綴**逐位不變**，一行都不用改。
+
+要改的只有提交那一層：`w_j = acc[j] & nd_j`（只有真送出的 lane 才配暫存器、才寫 RAT）。
+
+> **規則 1 原本是為程式順序訂的，結果順便解決了旁路問題。
+> 一條為 A 訂的約束解掉 B，通常表示 A 是對的抽象。**
+
+補充兩個正確做法：
+- **保留的 uop 必須重新查 RAT，不可跨拍快取。** 它們根本沒離開 decode queue；
+  下一拍佇列壓縮、重新查 `rat_q`（此時已含上一拍被接受 lane 的寫入）。
+  「沿用上一拍算好的值」在相依於同 bundle 時碰巧一致，相依於更早的東西時會錯。
+- **不可替未送出的 lane 預配實體暫存器。** freelist 位元只在真送出時才清，
+  否則下一拍重配 → 洩漏。
+
+### (2) 跨模組不變量：`n_xfer` 三方一致
+
+```
+fe:   出隊 = min(n_pres, de_nready)
+rn:   配置 = min(want, n_free, rn_nready)
+ds:   取用 = min(popcount(rn_valid), rn_nready)
+```
+
+三式因 `rn_valid = thermometer(min(want, n_free))` 且 `de_nready = min(n_free, rn_nready)` 恆等。
+
+> **若 `be_dispatch` 取得比 `min(popcount(rn_valid), rn_nready)` 少
+> （例如自己再濾掉 wrong-path uop），rename 就會替沒被收下的 uop 配了實體暫存器
+> → 下一拍重配 → 實體暫存器洩漏。**
+
+規則 4 必須被下游**嚴格**遵守，不可「少收一點比較安全」。
+
+### (3) 規則 2 的必然代價：容量低報
+
+`de_nready` 不准看 `de_duop`（規則 2），所以 rename 只能假設「每條 uop 都要配暫存器」。
+進來的是 store/branch 時會**低報容量**。
+
+這是協定的代價不是 bug —— 消除它就得讓 `nready` 看 `valid`，立刻成組合迴圈。
+
+**診斷方式**：若 `cnt_lost_rename` 在 freelist 沒滿時仍很大，就是這個保守性在作用。
+
+（與 Agent F 的 `lsq_nfree` 緊界證明是同一個現象的兩種表現：
+**看不到 bundle 組成時，保守是唯一安全的選擇，代價可量測但不可消除。**）
+
+## v9（2026-09-22）— wrong-path shadow
+
+### §15 `shadow_off` 改成相對偏移（Agent H 回報的格式上限）
+
+`shadow_off` 是 `uint32_t`。v8 以前存**絕對檔案偏移**，但 50M trace 的 correct-path 區
+就佔 800 MB，只剩 **K ≈ 349** 的餘裕；**200M 指令的 trace 在任何 K 下都會溢位**。
+
+**裁決（修正）**：**維持絕對偏移，列為已知上限。**
+
+監督者原本裁決「改成相對」並寫進了 `bstf.h` 的註解，**但沒有派任何人實作** ——
+H 產生的資料與 G 的 reader 都仍是絕對偏移。**規格只改在紙上，資料沒動。**
+若當時有人照註解實作，兩端會立刻對不起來。
+
+這是本專案第 N 次「文件與實作分岔」，而且是監督者自己造成的。
+**改規格必須同時派實作，否則就只記為已知限制。**
+
+目前處置：
+- `bstf.h` 的註解改回描述**實際**格式（絕對偏移）
+- 上限（50M trace 時 K≈349，200M 任何 K 都溢位）記為已知限制
+- `bstf_gen` 已加硬性失敗而非靜默 wrap —— 那是正確處置
+- 真要修時，改成相對可買 5× 餘裕，但需同時改 H 的產生端與 G 的 reader
+
+（Agent H 原本加了硬性失敗而非靜默 wrap —— **那是正確的處置**：
+格式上限應該炸出來，不該悄悄算錯。）
+
+### §16 wrong-path 的已知近似（讀結果時必須知道）
+
+Agent H 的 shadow 由一個自寫的 RV64IMC+Zba/Zbb/Zbs 執行引擎產生
+（commit log 依定義只含 retire 的指令，wrong path 必須**重新執行**才有）。
+
+**可信度依據**：同一引擎對完整 correct path 逐條 lockstep，
+**50,010,138 條指令中 0 個未支援編碼、0 個目的值錯、0 個有效位址錯、0 個 next-PC 錯**
+（7 條 CSR/SYSTEM 刻意不模擬）。lockstep 本身也是**找出引擎 bug 的工具**。
+
+**三項殘留近似：**
+
+1. **139,926 / 625,800（22%）的 shadow 來自「因 fetch 寬度而結束」的 block**，
+   所以種子暫存器狀態比誤預測的那條 branch 晚 1~3 條指令。
+2. **9,861 個 target-only 誤預測被模型化成 BTB miss（順序 fetch）**，
+   而非「BTB 有舊 entry 指向別處」。**舊目標無法從 trace 回推。**
+3. **`jalr`/`ret` 的間接跳躍佔 760 個（0.12%）**，用 dummy uop 退化處理。
+   這個比例遠低於預期的 5%，因為**直接分支的 target-only 誤預測仍可展開**（BTB miss → 順序）。
+
+### §17 padding 的檢查必須看位置不看內容
+
+Agent H 的第一版用「內容」判斷 shadow 區的 padding，**產生 995 個假陽性** ——
+因為真實 wrong-path 上的 `c.nop` 與 pad 記錄**逐位元相同**。
+
+> **任何「用內容辨識結構」的檢查都要先問：這個內容會不會合法出現？**
+
+### §18 分離的 overlay 必須帶「真實執行順序」的索引
+
+`.mem.wp.txt` 若單獨餵給 cache 模擬器，**等於完全沒有模擬污染** —— 而污染正是要它的理由。
+
+Agent H 加了 `after_mem_idx`（該筆 wrong-path 存取之前有幾筆 correct-path `.mem`），
+讓下游能把兩股串流合併回真實順序，同時保持兩個 overlay 檔分離。
+
+另：**存取到未映射頁面的 6,803 筆不輸出** —— 會 fault 的存取根本到不了 cache，
+輸出垃圾位址會污染 cache 模擬器的 tag array。
+
+### §19 `.fe.wp` 的粒度 —— 監督者從未定義，導致兩端假設不同
+
+整合時 Agent G 的 reader 報：
+
+```
+.fe.wp: size 155,810 != expected 623,240   （差 4 倍）
+```
+
+兩邊的假設：
+
+| | 粒度 | 算式 |
+|---|---|---|
+| **Agent A 產生的** | **每個 wrong-path fetch block 一 byte** | 15,581 誤預測 × D=10 = **155,810** |
+| **Agent G 的 reader** | 每條 wrong-path 指令一 byte | `shadow_bytes / rec_bytes` = **623,240** |
+
+**兩邊都自洽，合起來不對** —— 因為 CONTRACT §5（v4）定義 `.fe.wp` 時只寫了
+「第 k 次誤預測對應 byte 區間 `[k*D, (k+1)*D)`」，**沒有說 D 的單位是 block 還是指令**。
+
+**裁決：`.fe.wp` 的粒度是 fetch block**，與 `.fe` 一致（`.fe` 也是每 block 一 byte）。
+理由：它存的是 `FE_*` 事件（bubble 數、uBTB 命中、override），那些都是 **block 層級**的屬性，
+不是指令層級的。
+
+```
+.fe      每個 correct-path fetch block 一 byte
+.fe.wp   每個 wrong-path   fetch block 一 byte，第 k 次誤預測 = [k*D, (k+1)*D)
+.mem     每個 data 存取一 byte
+.mem.wp  每筆 wrong-path data 存取一列（文字，含 after_mem_idx）
+base     每條指令 16 byte
+```
+
+**四種 overlay，三種不同的粒度。** 這是這次缺陷的根本成因 ——
+而它到整合才現形，因為 `shadow_off` 在此之前一直是 0，`.fe.wp` 從未被讀取過。
+
+> **每個 overlay 的粒度必須在契約裡明寫，不能靠「跟另一個一樣」推論。**
+
+## §20 參數化必須做到「單一來源」，per-config 手改檔不算參數化
+
+v4 修正：`RUOP_S1/S2/D` 從第一個 commit 起就是寫死的 6 bit（`21:16` / `14:9` /
+`7:2`），而 rename 端寫入的是 `` `PRF_W `` 寬的值。`PRF_N > 64` 時 Verilog 把高位
+**靜默截斷**，實體暫存器編號發生別名，rename→IQ→EU→ROB 的整條相依鏈全錯，
+表現是 LSQ 永久 full、IPC 掉到 0.004。
+
+三層驗證全部沒抓到：
+
+| 驗證 | 為什麼放過 |
+|---|---|
+| `verilator --lint-only -Wall` | 位元寬度不匹配的隱式截斷不是 warning |
+| free list 自測 | 只檢查可配置數 = `PRF_N - 32`，不經過 RUOP 編碼 |
+| 模組級 TB | Agent E 在 `/tmp/agente_prf/prf7,prf8/` **手改了 per-config 的 ifc.vh**（`RUOP_W 48`、`RUOP_S1 24:18`），所以它的 TB 是對的 —— 但那份重佈局沒進 repo |
+
+**後果**：dd31c15 發布的 PRF 64/96/128/192/256 表來自 Agent E 的 scratch，不是整合
+模型跑 CoreMark 的結果。整合模型在 repo 裡從來沒有能力表示編號 ≥ 64 的實體暫存器。
+
+**裁決**：
+1. 多位元欄位一律用 `` `FIELD +: 寬度 `` 存取，欄位基底由參數算出，不得寫 `[hi:lo]`。
+2. 參數 sweep 的交付物是**同一份原始碼**跑不同 `define`。任何「我改了一份 config
+   專用的檔案來跑」都不是參數化 —— 那份改動如果不在 owner 的檔案裡，它就不存在。
+3. 模組級 TB 通過不代表整合通過。跨模組的編碼契約只有整合跑真 trace 才會驗到。

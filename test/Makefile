@@ -8,7 +8,7 @@ CFLAGS   ?= $(OPT) $(ARCH) -std=c11 -Wall -Wextra -I$(RT) -I$(TOP)/include -Imoc
 LDLIBS    = -pthread
 LIB       = $(RT)/libbstm.a
 
-UNIT  := t_transpose t_bstf t_refill t_refill_wp t_batch t_stats t_pool t_end2end
+UNIT  := t_transpose t_bstf t_refill t_refill_wp t_shadow t_batch t_stats t_pool t_end2end
 BENCH := bench_transpose bench_refill
 TRACES := traces/synth0.bstf traces/synth1.bstf
 
@@ -52,14 +52,16 @@ bench: all $(TRACES)
 equiv:
 	$(MAKE) -C equiv run
 
-# 用 Agent H 產生的真 trace 做整合檢查（overlay 還沒好，所以用 BSTF_LAX）
+# 用 Agent H 產生的真 trace 做整合檢查。overlay 都齊了，所以不再需要 BSTF_LAX。
 REAL ?= $(TOP)/traces/coremark_1m
 check-real: all
-	./build/bstfdump $(REAL) 6 --lax
-	BSTF_LAX=1 ./build/t_refill   $(REAL)
-	BSTF_LAX=1 ./build/t_end2end  $(REAL) $(REAL)
+	./build/bstfdump  $(REAL) 6
+	./build/t_refill  $(REAL)
+	./build/t_refill_wp $(REAL)
+	./build/t_shadow  $(REAL)
+	./build/t_end2end $(REAL) $(REAL)
 	$(MAKE) -C equiv build/equiv_mock
-	BSTF_LAX=1 ./equiv/build/equiv_mock 200000 $(REAL)
+	./equiv/build/equiv_mock 200000 $(REAL)
 
 clean:
 	rm -rf build

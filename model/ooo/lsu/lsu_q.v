@@ -33,7 +33,7 @@ module lsu_q (
     input  wire [`W*`ROB_W-1:0]  req_rob,
     input  wire [`W*8-1:0]       req_ev,     // 未用，保留
     output wire                  lsu_ready,
-    output wire                  lsq_full,
+    output wire [2:0]            lsq_nfree,   // v8: partial accept，見 README §5c
     output wire                  mshr_full,
     output wire [`W-1:0]         done_v,
     output wire [`W*`ROB_W-1:0]  done_rob,
@@ -77,7 +77,8 @@ module lsu_q (
     localparam [LQCW-1:0]  LD_MAXV  = LDN;
     localparam [LQCW-1:0]  ST_MAXV  = STN;
     localparam [LQCW-1:0]  LQ_ZERO  = {LQCW{1'b0}};
-    localparam [LQCW-1:0]  LQ_MINV  = `W;   // 見 §5「最小可表示尺寸」
+    localparam [LQCW-1:0]  W_V      = `W;
+    localparam [2:0]       W_N      = `W;
     localparam [MQCW-1:0]  MQ_MAXV  = MQN;
     localparam [HDW-1:0]   TGT_MAX  = {HDW{1'b1}};  // = HD-1（HD 必須是 2 的冪）
     localparam [7:0]       HD_LAT   = HD;
@@ -178,19 +179,24 @@ module lsu_q (
     assign cnt_st_mshr = stmshr;
 
     // ================= 尺寸 mask（runtime）=================
-    // cfg 夾在 [`W, LDQ_N]。下限是 `W：*_ready 是 all-or-nothing（CONTRACT v2），
-    // 一組最多 W 條記憶體 uop 必須整組放得下，所以小於 W 的 LSQ 無法表示。
-    // 夾住而不是掛掉 —— 這樣 cfg 掃到最小值時模型仍前進（CONTRACT v7 §10.1）。
-    wire [LQCW-1:0] ld_cfg  = (cfg_ldq_entries > LD_MAXV) ? LD_MAXV : cfg_ldq_entries;
-    wire [LQCW-1:0] st_cfg  = (cfg_stq_entries > ST_MAXV) ? ST_MAXV : cfg_stq_entries;
-    wire [LQCW-1:0] ld_max  = (ld_cfg < LQ_MINV) ? LQ_MINV : ld_cfg;
-    wire [LQCW-1:0] st_max  = (st_cfg < LQ_MINV) ? LQ_MINV : st_cfg;
+    // v8 partial accept：cfg 範圍回到 [1, LDQ_N]（v7.1 因 all-or-nothing 被迫夾到 `W）
+    wire [LQCW-1:0] ld_max  = (cfg_ldq_entries == LQ_ZERO
+                               || cfg_ldq_entries > LD_MAXV) ? LD_MAXV : cfg_ldq_entries;
+    wire [LQCW-1:0] st_max  = (cfg_stq_entries == LQ_ZERO
+                               || cfg_stq_entries > ST_MAXV) ? ST_MAXV : cfg_stq_entries;
 
     wire [LQCW-1:0] ld_free = ld_max - ld_cnt;
     wire [LQCW-1:0] st_free = st_max - st_cnt;
 
-    // 保守：整組 dispatch（最多 W 條）都放得下才不拉 full
-    assign lsq_full  = (ld_free < LQ_MINV) | (st_free < LQ_MINV);
+    // ---- lsq_nfree：這拍能收 bundle 最前面的幾條（CONTRACT v8 §6 v2）----
+    // 只看本模組自己的暫存器狀態，**不依賴 ds_valid / ds_ruop**（規則 2，防組合迴圈）。
+    // min(ld_free, st_free, `W) 是這個「不看 bundle 組成」前提下的**唯一緊界**：
+    //   一條 uop 可能要 LDQ（load）、要 STQ（store）、或兩者都要（AMO），
+    //   所以長度 N 的前綴最壞會吃掉 N 個 LDQ 且 N 個 STQ。
+    //   任何 N > min(ld_free, st_free) 都能被「N 條全 load」或「N 條全 store」打爆。
+    // 精確版（看 bundle 組成）能多收多少，見 README §5c 的實測。
+    wire [LQCW-1:0] lq_min   = (ld_free < st_free) ? ld_free : st_free;
+    assign lsq_nfree = (lq_min > W_V) ? W_N : lq_min[2:0];
     assign mshr_full = &ms_v;
     // be_eu 會把 pop 決定暫存一拍，所以 ready 只在緩衝全空時拉高，
     // 緩衝深度 PQN=8 足以吸收「ready 慢一拍」造成的 2 個 burst（最大佔用 6）。
@@ -604,7 +610,7 @@ module lsu_q (
 
         for (i = 0; i < `W; i = i + 1) begin
             u    = ds_ruop[i*`RUOP_W +: `RUOP_W];
-            ucls = u[`RUOP_CLASS];
+            ucls = u[`RUOP_CLASS +: `UC_W];
             is_amo = ds_valid[i] & ~flush & (ucls == `UC_AMO);
             is_ld  = (ds_valid[i] & ~flush & (ucls == `UC_LOAD))  | is_amo;
             is_st  = (ds_valid[i] & ~flush & (ucls == `UC_STORE)) | is_amo;
@@ -628,7 +634,7 @@ module lsu_q (
                         n_st_ar[e] = 1'b0;
                         n_st_st[e] = 1'b0;
                         n_st_rob[e*`ROB_W +: `ROB_W] = ds_robidx[i*`ROB_W +: `ROB_W];
-                        n_st_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D];
+                        n_st_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D +: `PRF_W];
                         // AMO 的 STQ entry 只是排序佔位：不佔埠、不回報 done
                         n_st_noacc[e] = is_amo;
                         n_st_dn[e]    = is_amo;
@@ -660,7 +666,7 @@ module lsu_q (
                         n_ld_blk[e] = conflict;
                         n_ld_wid[e*LQW +: LQW] = wid_i;
                         n_ld_rob[e*`ROB_W +: `ROB_W] = ds_robidx[i*`ROB_W +: `ROB_W];
-                        n_ld_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D];
+                        n_ld_prf[e*`PRF_W +: `PRF_W] = u[`RUOP_D +: `PRF_W];
                         n_ld_lvl[e*2 +: 2] = uev[1:0];      // MEM_LEVEL
                         n_ld_lc[e*4 +: 4]  = uev[7:4];      // MEM_LAT_CLASS
                     end

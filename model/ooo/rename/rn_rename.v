@@ -17,16 +17,18 @@ module rn_rename (
     input  wire clk, input wire rst, input wire flush,
     input  wire [`W-1:0]         de_valid,
     input  wire [`W*`DUOP_W-1:0] de_duop,
-    output wire                  de_ready,
+    output wire [2:0]            de_nready,    // v8: 我這拍能收前 N 條（0..`W）
     output wire [`W-1:0]         rn_valid,
     output wire [`W*`RUOP_W-1:0] rn_ruop,
-    input  wire                  rn_ready,
+    input  wire [2:0]            rn_nready,    // v8: 下游這拍能收前 N 條
     input  wire [`W-1:0]         cmt_valid,
     input  wire [`W-1:0]         cmt_dv,
     input  wire [`W*`ARF_W-1:0]  cmt_arf,
     input  wire [`W*`PRF_W-1:0]  cmt_prf,      // v2: 新 mapping（非舊的）
     output wire [47:0]           cnt_st_rename,
-    output wire [47:0]           cnt_st_backpressure
+    output wire [47:0]           cnt_st_backpressure,
+    output wire [47:0]           cnt_lost_rename,
+    output wire [47:0]           cnt_lost_backpressure
 );
 
 localparam ARF_N  = 32;          // 架構暫存器數，demo 只用 x0..x31
@@ -34,6 +36,8 @@ localparam ARF_N  = 32;          // 架構暫存器數，demo 只用 x0..x31
 //      做 PRF/ROB sweep 時不可以跟著改（也不要被 regex 一把掃掉）----
 localparam ARFI_W = 5;           // 架構暫存器索引寬度 = DUOP_D 寬度（ARF_N=32）
 localparam CNT_B  = 6;           // 48-bit counter 切成 6 段 8-bit 進位鏈
+localparam CW     = CNT_B * 8;   // = 48，counter 埠寬
+localparam TCW    = $clog2(`W) + 1;   // 條數計數寬度（0..`W 都要裝得下）
 localparam DW     = `DUOP_W;
 localparam RW     = `RUOP_W;
 
@@ -147,7 +151,38 @@ wire fnd1 = (sl1 == 2'd0) ? ffd[0] : (sl1 == 2'd1) ? ffd[1] : (sl1 == 2'd2) ? ff
 wire fnd2 = (sl2 == 2'd0) ? ffd[0] : (sl2 == 2'd1) ? ffd[1] : (sl2 == 2'd2) ? ffd[2] : ffd[3];
 wire fnd3 = (sl3 == 2'd0) ? ffd[0] : (sl3 == 2'd1) ? ffd[1] : (sl3 == 2'd2) ? ffd[2] : ffd[3];
 
-wire enough_free = (~nd0 | fnd0) & (~nd1 | fnd1) & (~nd2 | fnd2) & (~nd3 | fnd3);
+// ---------------- v8 partial accept ----------------
+// 可配的實體暫存器數（0..`W）。ffd 是遞減的（找得到第 k 個 -> 一定找得到第 k-1 個），
+// 所以直接加總就是「這拍最多能配幾個」。
+// 重點：這個值**只看 freelist 自己**，完全不看 de_valid（規則 2：nready 不得依賴 valid）。
+wire [TCW-1:0] n_free = {{(TCW-1){1'b0}}, ffd[0]} + {{(TCW-1){1'b0}}, ffd[1]}
+                      + {{(TCW-1){1'b0}}, ffd[2]} + {{(TCW-1){1'b0}}, ffd[3]};
+wire unused_fnd = |{fnd0, fnd1, fnd2, fnd3};
+
+// 我能收前 N 條 = min(自己配得出幾個, 下游能收幾條)
+assign de_nready = (n_free < rn_nready) ? n_free : rn_nready;
+
+// 上游送來的 bundle 是依序的 thermometer；want = 想送的條數
+wire [TCW-1:0] want = de_valid[0] ? (de_valid[1] ? (de_valid[2] ?
+                      (de_valid[3] ? 3'd4 : 3'd3) : 3'd2) : 3'd1) : 3'd0;
+
+// 本模組自己的資源能吃下幾條（供 rn_valid 用，不看下游 -> 不形成 valid/ready 迴圈）
+wire [TCW-1:0] n_ok    = (want < n_free) ? want : n_free;
+// 實際送出 = min(want, de_nready)；與下游算出的 min(popcount(rn_valid), rn_nready) 一致
+wire [TCW-1:0] n_xfer  = (n_ok  < rn_nready) ? n_ok : rn_nready;
+
+// 接受一定是「最前面的 n 條」（規則 1）。因為是前綴，
+// bundle 內旁路與配額序號完全不用改：lane j 只旁路自 lane i<j，
+// 而 j 被接受 => 所有 i<j 也被接受。
+wire [`W-1:0] acc;
+genvar ga;
+generate
+for (ga = 0; ga < `W; ga = ga + 1) begin : g_acc
+    localparam [TCW-1:0] GA = ga;
+    assign acc[ga]      = (GA < n_xfer);
+    assign rn_valid[ga] = (GA < n_ok);      // 下游只會取前 rn_nready 條
+end
+endgenerate
 
 // ---------------- 來源暫存器：RAT + bundle 內旁路 ----------------
 wire [`ARF_W-1:0] a1_0 = d0[`DUOP_S1];  wire [`ARF_W-1:0] a2_0 = d0[`DUOP_S2];
@@ -225,31 +260,30 @@ for (gj = 0; gj < `W; gj = gj + 1) begin : g_ruop
     always @* begin
         ru = {RW{1'b0}};                       // 保留位元一律填 0
         ru[`RUOP_WRONGPATH] = wp_v[gj];
-        ru[`RUOP_CLASS]     = cls_v[gj*`UC_W +: `UC_W];
-        ru[`RUOP_LAT]       = lat_v[gj*`LAT_W +: `LAT_W];
+        ru[`RUOP_CLASS +: `UC_W]     = cls_v[gj*`UC_W +: `UC_W];
+        ru[`RUOP_LAT +: `LAT_W]       = lat_v[gj*`LAT_W +: `LAT_W];
         ru[`RUOP_S1V]       = s1v_v[gj];
-        ru[`RUOP_S1]        = ps1_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_S1 +: `PRF_W]        = ps1_v[gj*`PRF_W +: `PRF_W];
         ru[`RUOP_S2V]       = s2v_v[gj];
-        ru[`RUOP_S2]        = ps2_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_S2 +: `PRF_W]        = ps2_v[gj*`PRF_W +: `PRF_W];
         ru[`RUOP_DV]        = dv_v[gj];
-        ru[`RUOP_D]         = pd_v[gj*`PRF_W +: `PRF_W];
+        ru[`RUOP_D +: `PRF_W]         = pd_v[gj*`PRF_W +: `PRF_W];
         ru[`RUOP_MEMSTORE]  = ms_v[gj];
         ru[`RUOP_SERIALIZE] = sz_v[gj];
-        ru[`RUOP_ARFD]      = ad_v[gj*ARFI_W +: ARFI_W];
+        ru[`RUOP_ARFD +: `RUOP_ARFD_W]      = ad_v[gj*ARFI_W +: ARFI_W];
         ru[`RUOP_ARFDV]     = adv_v[gj];
     end
     assign rn_ruop[gj*RW +: RW] = ru;
 end
 endgenerate
 
-assign rn_valid = de_valid & {`W{enough_free}};
-assign de_ready = rn_ready & enough_free;
-
-wire xfer = de_ready & (|de_valid);
-wire w0 = xfer & nd0;
-wire w1 = xfer & nd1;
-wire w2 = xfer & nd2;
-wire w3 = xfer & nd3;
+// 只有「真的送出去」的 lane 才配實體暫存器、才寫 RAT。
+// 沒送出的 lane 這拍什麼都不做（freelist 位元不清），下一拍它會從
+// decode queue 的 lane 0 重新進來、重新查 RAT、重新配 —— 不會洩漏實體暫存器。
+wire w0 = acc[0] & nd0;
+wire w1 = acc[1] & nd1;
+wire w2 = acc[2] & nd2;
+wire w3 = acc[3] & nd3;
 
 // ---------------- commit（介面 v2）----------------
 // ROB 給的是「這條 uop 寫入的實體暫存器」，舊的由 cRAT 查出來釋放。
@@ -346,67 +380,64 @@ always @(posedge clk) begin
     end
 end
 
-// ---------------- counter（6 段 8-bit 進位鏈）----------------
-// 歸因原則：一個 stall cycle 只能記在「真正的來源」身上，不可重複計。
-//   cnt_st_rename       = 前端有東西要送，但 rename 自己的資源不夠（freelist 耗盡）
-//   cnt_st_backpressure = rename 有能力送，但下游 (rn_ready=0) 不收
-// 兩者由 enough_free 互斥（不會同時 +1）；下游是誰造成的由下游自己的
-// cnt_st_iq / lsq / rob / mshr 負責，本模組不碰。
-// 兩者都排除 flush 拍：be_dispatch 在 flush 時會拉低 rn_ready，那是誤預測
-// 懲罰（已計在 cnt_mispred / cnt_wrongpath），不是下游資源不足。
-// 註：若同一拍「freelist 也空、下游也不收」，依上面的順序記在 cnt_st_rename
-// （自己的資源優先）。此時兩個原因同時成立，單修一邊都救不了。
-wire c_rn_inc = (|de_valid) & ~enough_free & ~flush;
-wire c_bp_inc = (|de_valid) &  enough_free & ~rn_ready & ~flush;
-reg  [47:0] c_rn_q;
-wire [CNT_B-2:0] c_rn_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [CNT_B-1:0] c_rn_car;
-genvar gr;
+// ---------------- counter（CONTRACT v8 §8 v2）----------------
+// partial accept 之後「每拍恰好一個來源」不夠用（一拍可能收 2 擋 2），
+// 所以每個來源都有兩個互補的量：
+//   cnt_st_*   完全停擺的拍數（想送但一條都沒送出）—— 互斥、可加總
+//   cnt_lost_* 損失的 uop-slot（想送 − 實際送）—— 單位是 uop，一拍可加 0..`W
+// 歸因仍然是「先算自己的資源、再算下游」，兩者相加恰好等於總損失：
+//   lost_rename + lost_backpressure == want - n_xfer
+wire stall_all = (want != {TCW{1'b0}}) & (n_xfer == {TCW{1'b0}}) & ~flush;
+wire [TCW-1:0] inc_st_rn = (stall_all & (n_free == {TCW{1'b0}})) ? 3'd1 : 3'd0;
+wire [TCW-1:0] inc_st_bp = (stall_all & (n_free != {TCW{1'b0}})) ? 3'd1 : 3'd0;
+wire [TCW-1:0] inc_ls_rn = flush ? 3'd0 : (want - n_ok);     // freelist 擋掉的
+wire [TCW-1:0] inc_ls_bp = flush ? 3'd0 : (n_ok - n_xfer);   // 下游擋掉的
+
+localparam NC = 4;   // 0=st_rename 1=st_backpressure 2=lost_rename 3=lost_backpressure
+wire [NC*TCW-1:0] cnt_inc = {inc_ls_bp, inc_ls_rn, inc_st_bp, inc_st_rn};
+
+reg  [NC*CW-1:0]        cnt_q;
+wire [NC*9-1:0]         cnt_s0;                 // byte0 的 9-bit 和（含進位輸出）
+wire [NC*(CNT_B-1)-1:0] cnt_car;                // 進到 byte 1..CNT_B-1 的進位
+genvar gc, gi;
 generate
-for (gr = 0; gr < CNT_B-1; gr = gr + 1) begin : g_rn
-    assign c_rn_ff[gr] = (c_rn_q[8*gr +: 8] == 8'hFF);
+for (gc = 0; gc < NC; gc = gc + 1) begin : g_cnt
+    // byte0 一次加 0..`W（8-bit 加法 + 進位輸出，規則 1：沒有寬算術）
+    assign cnt_s0[gc*9 +: 9] = {1'b0, cnt_q[gc*CW +: 8]}
+                             + {{(9-TCW){1'b0}}, cnt_inc[gc*TCW +: TCW]};
+    // byte 1..CNT_B-2 是否為 8'hFF（最高 byte 的進位沒有去處，不需要）
+    // 不自我參照，避免 UNOPTFLAT 組合迴圈
+    wire [CNT_B-3:0] ff;
+    for (gi = 1; gi < CNT_B-1; gi = gi + 1) begin : g_ff
+        assign ff[gi-1] = (cnt_q[gc*CW + 8*gi +: 8] == 8'hFF);
+    end
+    wire k0 = cnt_s0[gc*9 + 8];          // byte0 的進位輸出
+    // 以下 5 行對應 CNT_B=6；改 CNT_B 要一起改
+    assign cnt_car[gc*(CNT_B-1) + 0] = k0;
+    assign cnt_car[gc*(CNT_B-1) + 1] = k0 & ff[0];
+    assign cnt_car[gc*(CNT_B-1) + 2] = k0 & (&ff[1:0]);
+    assign cnt_car[gc*(CNT_B-1) + 3] = k0 & (&ff[2:0]);
+    assign cnt_car[gc*(CNT_B-1) + 4] = k0 & (&ff[3:0]);
 end
 endgenerate
-// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
-assign c_rn_car[0] = c_rn_inc;
-assign c_rn_car[1] = c_rn_inc & c_rn_ff[0];
-assign c_rn_car[2] = c_rn_inc & (&c_rn_ff[1:0]);
-assign c_rn_car[3] = c_rn_inc & (&c_rn_ff[2:0]);
-assign c_rn_car[4] = c_rn_inc & (&c_rn_ff[3:0]);
-assign c_rn_car[5] = c_rn_inc & (&c_rn_ff[4:0]);
 
-reg  [47:0] c_bp_q;
-wire [CNT_B-2:0] c_bp_ff;
-wire [CNT_B-1:0] c_bp_car;
-genvar gb;
-generate
-for (gb = 0; gb < CNT_B-1; gb = gb + 1) begin : g_bp
-    assign c_bp_ff[gb] = (c_bp_q[8*gb +: 8] == 8'hFF);
-end
-endgenerate
-// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
-assign c_bp_car[0] = c_bp_inc;
-assign c_bp_car[1] = c_bp_inc & c_bp_ff[0];
-assign c_bp_car[2] = c_bp_inc & (&c_bp_ff[1:0]);
-assign c_bp_car[3] = c_bp_inc & (&c_bp_ff[2:0]);
-assign c_bp_car[4] = c_bp_inc & (&c_bp_ff[3:0]);
-assign c_bp_car[5] = c_bp_inc & (&c_bp_ff[4:0]);
-
-integer ic;
+integer ic, jc;
 always @(posedge clk) begin
-    if (rst) begin
-        c_rn_q <= 48'd0;
-        c_bp_q <= 48'd0;
-    end else begin
-        for (ic = 0; ic < CNT_B; ic = ic + 1) begin
-            if (c_rn_car[ic]) c_rn_q[8*ic +: 8] <= c_rn_q[8*ic +: 8] + 8'd1;
-            if (c_bp_car[ic]) c_bp_q[8*ic +: 8] <= c_bp_q[8*ic +: 8] + 8'd1;
+    if (rst) cnt_q <= {NC*CW{1'b0}};
+    else begin
+        for (jc = 0; jc < NC; jc = jc + 1) begin
+            cnt_q[jc*CW +: 8] <= cnt_s0[jc*9 +: 8];
+            for (ic = 1; ic < CNT_B; ic = ic + 1)
+                if (cnt_car[jc*(CNT_B-1) + (ic-1)])
+                    cnt_q[jc*CW + 8*ic +: 8] <= cnt_q[jc*CW + 8*ic +: 8] + 8'd1;
         end
     end
 end
 
-assign cnt_st_rename       = c_rn_q;
-assign cnt_st_backpressure = c_bp_q;
+assign cnt_st_rename         = cnt_q[0*CW +: CW];
+assign cnt_st_backpressure   = cnt_q[1*CW +: CW];
+assign cnt_lost_rename       = cnt_q[2*CW +: CW];
+assign cnt_lost_backpressure = cnt_q[3*CW +: CW];
 
 // ---------------- 編譯期斷言（CONTRACT v7 §10）----------------
 // 本模組的 lane 邏輯是對 `W = 4 手動展開的（d0..d3 的 bundle 內旁路鏈）。

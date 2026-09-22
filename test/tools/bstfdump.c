@@ -38,6 +38,10 @@ int main(int argc, char **argv)
            (unsigned long long)t.n_mem, (unsigned long long)t.hdr->n_mem_access,
            (unsigned long long)t.n_fe_wp, (unsigned long long)t.n_mem_wp,
            (unsigned long long)t.n_imem);
+    printf("  wrong-path 排版：.fe 裡 FE_REDIRECT 的 block 數 N=%llu，"
+           ".fe.wp D=%llu block/次，shadow stride=%llu 記錄/次\n",
+           (unsigned long long)t.n_mispred, (unsigned long long)t.fe_wp_depth,
+           (unsigned long long)t.shadow_stride);
     if (t.meta && bstf_meta_get(&t, "config_fingerprint", buf, sizeof buf) == 0)
         printf("  meta config_fingerprint = %s\n", buf);
 

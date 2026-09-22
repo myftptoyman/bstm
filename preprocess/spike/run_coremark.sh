@@ -83,6 +83,16 @@ fi
 SHA=$(sha256sum "$ELF" | cut -d' ' -f1)
 SPIKE_CMD="$SPIKE --isa=$ISA --csr-marchid $MARCHID --reset-vector=$RSTVEC -m$MEM --pc=0x0 -l --log-commits $ELF"
 
+# Wrong-path shadow needs Agent A's .fe overlay for the *same* trace; if it is
+# not there yet, run frontend_sim first and re-run this script.
+FE_ARG=()
+if [ -r "$OUTDIR/$NAME.fe" ]; then
+  FE_ARG=(--fe "$OUTDIR/$NAME.fe" --shadow-k "${SHADOW_K:-40}" --shadow-blocks "${SHADOW_D:-10}")
+  echo "    shadow: using $OUTDIR/$NAME.fe  (K=${SHADOW_K:-40}, D=${SHADOW_D:-10})"
+else
+  echo "    shadow: $OUTDIR/$NAME.fe not present -> no wrong-path shadow this pass"
+fi
+
 echo "=== spike -> bstf_gen: $NAME ($COUNT instructions) ==="
 echo "    elf   : $ELF"
 echo "    sha256: $SHA"
@@ -102,6 +112,7 @@ set +e
     --fetch-width "$FETCH_WIDTH" \
     --line "$LINE" \
     --audit 100 \
+    "${FE_ARG[@]}" \
     --elf "$ELF" --elf-sha256 "$SHA" \
     --spike-cmd "$SPIKE_CMD" \
     --note "CoreMark steady state: trace starts at the first retire of start_time() (PC $START_PC)"
@@ -113,4 +124,5 @@ echo
 "$HERE/bstf_check" "$OUTDIR/$NAME.bstf" \
     --fe   "$OUTDIR/$NAME.frontend.txt" \
     --mem  "$OUTDIR/$NAME.mem.txt" \
-    --imem "$OUTDIR/$NAME.imem.txt"
+    --imem "$OUTDIR/$NAME.imem.txt" \
+    $([ -r "$OUTDIR/$NAME.mem.wp.txt" ] && echo --memwp "$OUTDIR/$NAME.mem.wp.txt")

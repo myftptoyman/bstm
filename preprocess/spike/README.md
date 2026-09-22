@@ -295,3 +295,177 @@ are a single instruction.
 | `run_coremark.sh` | the whole pipeline (`--self-test` / `--small` / `--full` / `--whole`) |
 | `elf/` | generated, iteration-patched ELF copies |
 | `selftest/` | generated, `make test` output |
+
+---
+
+## 11. Wrong-path shadow
+
+`.bstf` v2 carries a wrong-path expansion for every mispredicted fetch block.
+Without it the model never flushes, never rolls back and never spends a
+resource on a squashed uop -- i.e. it is missing the dominant effect in an OOO
+core, not a feature.
+
+### 11.1 How the wrong path is produced
+
+There is no way to get a wrong path out of a commit log: by construction the
+log only contains instructions that retired. So `bstf_gen` reconstructs the
+architectural state and then **executes** the mis-speculated path itself.
+
+* `rv64_exec.h` is a small RV64IMC + Zba/Zbb/Zbs execution engine (RVC is
+  expanded to its 32-bit form first, so there is one executor, not two).
+* The register file is replayed from the commit log's `reg <= value` lines;
+  the memory image is seeded from the ELF's `PT_LOAD` segments and updated
+  from every `mem[...] <= value` line. Both are **spike's values, not ours** --
+  we execute, compare, then adopt spike's result, so a disagreement can never
+  accumulate.
+* At a mispredicting block the register file is forked (a struct copy) and the
+  memory image gets a byte-granular copy-on-write overlay, so speculative
+  stores cannot corrupt the architectural image. The overlay is dropped when
+  the shadow ends.
+
+**Why this is trustworthy:** the same engine runs in lockstep over the entire
+correct path, and every destination register value, every effective address
+and every next-PC is compared against spike. Over 50,010,138 instructions:
+
+```
+unsupported encodings  : 0
+CSR/SYSTEM not modelled: 7  (deliberate -- see below)
+wrong dest reg/value   : 0
+wrong effective address: 0
+wrong next PC          : 0
+```
+
+An engine that matches spike exactly for 50 M instructions is a reasonable
+thing to trust for the 33 instructions of a wrong path. The lockstep check is
+also what *found* the engine's bugs: it flagged every unimplemented opcode
+until the count reached zero, which is how the Zbb `sext.h` family and the
+`rev8`/`orc.b` `funct6` constants got fixed.
+
+### 11.2 Which branches are expanded
+
+Exactly the blocks Agent A marked with `FE_REDIRECT` in `.fe`, in program
+order, so shadow block *k* is Agent A's mispredict *k* and lines up with the
+`[k*D, (k+1)*D)` layout of `.fe.wp` (CONTRACT A1/G5). The wrong-path start PC
+is chosen from the block's last instruction:
+
+| case | wrong-path start | 50 M count |
+|---|---|---|
+| conditional branch | taken ? fall-through : decoded target | 482,270 |
+| mid-block conditional branch (block closed on fetch width / line) | that branch's target | 139,926 |
+| direct jump whose target the BTB missed | fall-through | 2,844 |
+| **`jalr` / `ret`** | **unknown -> degenerate** | **760 (0.12%)** |
+
+### 11.3 The degenerate case (known upper bound of this method)
+
+For an indirect transfer the wrong path is whatever the BTB/RAS *predicted*,
+which is not recoverable from the trace. Those shadows are filled with `K`
+generic ALU uops in a rotating 8-register dependency pattern -- enough to
+occupy ROB/IQ/PRF realistically, but with no memory traffic and no real code.
+At **0.12 %** of shadows (760 of 625,800) this is a small bound; it is
+recorded as `shadow.degenerate_fraction` in the `.meta.json`.
+
+A second, softer approximation: 9,861 of the mispredicts are *target-only*
+(direction right, target wrong). For direct branches this is modelled as a
+BTB miss, i.e. the frontend ran on sequentially, rather than as a stale BTB
+entry pointing somewhere else. A stale target is not recoverable either.
+
+### 11.4 Layout
+
+```
+[ bstf_hdr_t (232 B) ][ n_records correct-path records ][ shadow area ]
+                                                        ^ hdr.shadow_offset
+```
+
+* Fixed stride: shadow block *k* occupies records `[k*K, (k+1)*K)` of the
+  shadow area, so `k = (shadow_off - hdr.shadow_offset) / rec_bytes / K`,
+  which is CONTRACT G5's formula.
+* `shadow_off` is an **absolute file offset** (0 = this record has no shadow).
+* `shadow_len` is the number of *real* wrong-path instructions; the remaining
+  `K - shadow_len` slots are canonical padding (`UC_NOP`, `exec_lat` 1, every
+  other field 0). `bstf_check` verifies padding **positionally**, not by
+  content -- a genuine wrong-path `c.nop` is byte-identical to a pad record.
+* Shadow records use the same `bstf_rec_t` layout, carry `BF_CALL`/`BF_RET`
+  and block ends on the same rules as the correct path, and never nest
+  (`shadow_off == 0` inside the shadow area).
+* `K` (`--shadow-k`, default 40) and the wrong-path block cap
+  (`--shadow-blocks`, default 10 = Agent A's `wrongpath_depth`) are both
+  recorded in every `.meta.json`. **Per Agent A's §10, `D` has a cliff at
+  `D == ubtb_entries`, so it is a sweep dimension, not a constant** -- the two
+  knobs are kept separate and the block cap is what normally binds
+  (33.49 instructions ≈ 10 blocks at 3.35 instructions/block).
+
+### 11.5 `<name>.mem.wp.txt` — wrong-path data accesses
+
+```
+<vaddr_hex> <size_bytes> <is_store> <is_ifetch=0> <pc_hex> <shadow_rec_idx> <after_mem_idx>
+```
+
+Dense (real accesses only), so Agent B's existing cache simulator can consume
+it unchanged. Two extra columns solve the problems a separate file would
+otherwise create:
+
+* `shadow_rec_idx` — index of the shadow record that made the access, giving
+  an O(1) mapping in both directions without a sidecar index file.
+* `after_mem_idx` — how many correct-path `.mem` rows precede this access in
+  true execution order. **This is what makes cache pollution modellable**: run
+  standalone and the two streams never interact; merge on this key and the
+  wrong-path accesses land in the cache exactly where they really happened.
+
+Speculative accesses outside any mapped page (6,803 at 50 M) are *not*
+emitted -- a faulting access never reaches the cache, and letting garbage
+addresses through would poison Agent B's tag arrays.
+
+### 11.6 Scale (50 M trace, K=40, D=10)
+
+| | |
+|---|---|
+| mispredicts expanded | 625,800 (100 % of `FE_REDIRECT` blocks) |
+| real expansions | 625,040 (99.88 %) |
+| wrong-path instructions | 20,959,994 (33.49 per mispredict) |
+| wrong-path fetch blocks | 6,257,962 (`.fe.wp` has 6,258,000 = 625,800 x 10) |
+| padding | 4,072,006 records (16.27 % of the shadow area) |
+| shadow area | 400,512,000 B — `.bstf` grows 1.50x |
+| wrong-path memory accesses | 2,140,645 |
+| truncated by an unsupported opcode | 6 |
+
+Shadow class mix (real instructions only): ALU 64.7 %, BRANCH 23.0 %,
+LOAD 8.1 %, STORE 2.1 %, JUMP 1.4 %, RET 0.3 %, MUL 0.1 %.
+
+### 11.7 Shadow validation
+
+* Every shadow instruction is cross-checked **decoder against executor** --
+  `rv64_decode.h` produces the record fields, `rv64_exec.h` produces the
+  behaviour, and the two share no code. Over 20,929,594 wrong-path
+  instructions: 0 memory-presence, 0 size, 0 store-direction, 0 destination
+  register and 0 branch-target disagreements.
+* `bstf_check` asserts the structural invariants: `shadow_offset` is exactly
+  the end of the correct path, the file is `header + records + shadow_bytes`,
+  the area is a whole number of fixed-stride blocks, every `shadow_off` is
+  aligned and in range, `shadow_len <= K`, G5's `k` is consistent, padding is
+  canonical and positionally correct, `sum(shadow_len) == real records`, and
+  no shadow nests.
+* `.mem.wp.txt` is validated against the shadow records: every
+  `shadow_rec_idx` is in range, references a `LOAD`/`STORE`/`AMO` record,
+  agrees with that record's `mem_store` bit, and is monotonic.
+* `<name>.shadow.txt` holds the first 200 wrong-path instructions with PC,
+  raw encoding and decoded fields, for eyeballing against `objdump`. Spot
+  check of shadow block 0 (starts at `0x100`) matches
+  `objdump -d` byte-for-byte, including `sd a0,1334(a5)` resolving to
+  `0x70000638` = `start_time_val`.
+
+### 11.8 Known limitations
+
+* **CSR/SYSTEM instructions are not executed** (7 in the whole program, all
+  outside the timed region). Hitting one on a wrong path truncates that
+  shadow; this happened 6 times in 50 M.
+* Speculative execution is **architecturally exact but memory-ordering naive**:
+  a wrong-path load reads the committed image plus this shadow's own stores.
+  It cannot see a store that a *different* in-flight speculative path made.
+* When a block closes on fetch width rather than on a taken branch, the
+  register state used to seed the shadow is the state after the block's last
+  instruction, not after the mispredicting branch inside it -- a skew of 1-3
+  instructions on 139,926 of 625,800 shadows.
+* `shadow_len` is `uint16_t`, so `K` cannot exceed 65,535; `shadow_off` is
+  `uint32_t`, so the shadow area cannot exceed 4 GiB. At K=40 the 50 M trace
+  uses 400 MB of a 4 GiB budget -- **K > ~400 would overflow `shadow_off`** on
+  a 50 M trace. `bstf_gen` does not currently check this.

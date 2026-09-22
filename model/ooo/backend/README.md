@@ -15,17 +15,24 @@
 
 ## 1. `be_dispatch`
 
-* **all-or-nothing**（ifc.vh v2 的 ready 語意）：`rn_ready = ~rob_full & ~lsq_full & ~mshr_full & ds_ready & ~flush`，
-  不依賴 `rn_valid`，所以不會跟 rename 形成組合迴路。
+* **v8 partial accept**：`rn_nready = min(rob_nfree, lsq_eff, ds_nready)`（flush 時 0），
+  其中 `lsq_eff = mshr_full ? 0 : lsq_nfree`（MSHR 滿等同 LSU 這拍收不下，
+  子原因由 `lsu_q` 的 `cnt_st_mshr` 區分）。
+  **完全不看 `rn_valid`** → 符合 CONTRACT v8 規則 2，不會有 valid↔ready 組合迴路。
+* 依序接受最前面的 `lim` 條 valid（不跳號），ROB index 只給被接受的那幾條依序配置。
 * ROB entry 用 round-robin tail 指標配置，每條有效 uop 推進一格，
   折返點是 `cfg_rob_entries`（不需要 2 的冪次，用 `>= cfg` 比較折返）。
   `ds_robidx` 每 lane 6 bit，無效 lane 的欄位維持前一條的值（ROB 端以 `ds_valid` 篩選）。
 * `flush` 當拍 `ds_valid` 全 0、tail 歸零，與 `be_rob` 的 head 歸零對齊。
 * v3 起 `rob_full`（來自 `be_rob`）與 `mshr_full`（來自 `lsu_q`）都是真回授，
   本模組不再自己估計 ROB 佔用，只保留 tail 指標。
-* counter：`cnt_st_rob`（有 uop 可送但 `rob_full`）、`cnt_st_lsq`（同上但卡在 `lsq_full`），
-  歸因順序 ROB > LSQ，一拍只記一個原因；MSHR 滿會 stall 但由 `lsu_q` 的 `cnt_st_mshr` 計，
-  本模組不重複計。
+* counter（v8 §8 兩個互補量）：
+  - `cnt_st_rob` / `cnt_st_lsq`：**完全停擺的拍數**（`lim==0` 且有東西要送），互斥
+  - `cnt_lost_rob` / `cnt_lost_lsq` / `cnt_lost_iq`：**損失的 uop-slot** = Σ(想送 − 實際送)，
+    依「誰是綁住的那一個」歸因（平手時 ROB > LSQ > IQ）
+  - **守恆**：`cnt_lost_rob + cnt_lost_lsq + cnt_lost_iq == Σ(想送 − 實際送)`，
+    回歸測試每一輪都會驗這條（見 §8.4）
+  - MSHR 滿併入 LSQ 歸因；子原因看 `lsu_q` 的 `cnt_st_mshr`
 * 註：counter 的計數條件含 `|rn_valid`，前提是 rename 遵守 valid/ready 協定
   （`ready=0` 時 `valid` 不得撤回）。若上游把 valid 收回去，stall 就不會被記到。
 
@@ -82,8 +89,15 @@ issue 出去時把該欄清掉（`e_age[i] <= e_age[i] & ~sel_m`），
 * `iss_*` 是**組合輸出**（select 當拍就送到 EU）。這是 back-to-back 能成立的前提，
   代價是 `prf_ready(reg) -> IQ select -> EU` 這條組合路徑比較長。
   時序模型不在意閘延遲，bit-sliced 後端只在意 cell 數，所以這個取捨是划算的。
-* `ds_ready = (有 W 個空槽)`，不依賴 `ds_valid` → 無組合迴路，符合 all-or-nothing 語意。
-* `cnt_st_iq` 計的是 `ds_ready == 0` 的 cycle 數（IQ 收不下一整組的拍數）。
+* `ds_nready = min(W, 空槽數)`，**不依賴 `ds_valid`** → 無組合迴路（CONTRACT v8 規則 2）。
+* partial accept 的配置：**第 j 條 valid 的 uop 進第 j 個空槽**（依序、不跳號），
+  age 仍照 lane 順序排，所以 oldest-first 的定序不受影響。
+  另外留了一道防呆：`alloc_en` 會再檢查「第 j 個空槽真的存在」，
+  上游若違約也只是不收，不會靜默蓋掉別人的 entry。
+* `cnt_st_iq` v8 改成「**真的一格都沒有**（`ds_nready == 0`）」的拍數。
+  v7 是「不足 W 格就算滿」，那會把 1~3 格可用的拍也算進去 —— 監督者在 LSQ 上量到
+  同類灌水佔 99.97%。**注意這個 counter 是容量側視角**（be_iq 沒有埠可以知道
+  上游想送幾條），需求側的損失由 `be_dispatch` 的 `cnt_lost_iq` 提供。
 * **空槽搜尋與「讀 `ds_*` 的部分」刻意拆成兩個 `always @*`**：
   合在一起的話 verilator 會判定 `ds_valid -> a_ok -> ds_ready -> be_dispatch -> ds_valid`
   是組合迴路（UNOPTFLAT），實際上 `a_ok` 只依賴 IQ 自己的狀態。
@@ -496,3 +510,257 @@ be_eu = `ROB_N*(4 + `LAT_W + `PRF_W)   ← pool：v + wt + dv + rq_pend + cnt + 
 runtime mask 會給一種假的安全感：**結構建到 128、mask 只開 64，
 所有測試都會過，而 64 以上的路徑從來沒被走過。**
 這次之後我的回歸測試一律掃 `cfg_*` 的 最小 / 中間 / MAX 三點。
+
+---
+
+## 9. v8 partial accept
+
+### 9.1 協定與實作
+
+| 埠 | v7 | v8 |
+|---|---|---|
+| `be_iq` | `output ds_ready` | `output [2:0] ds_nready` |
+| `be_dispatch` | `input ds_ready` / `output rn_ready` | `input [2:0] ds_nready` / `output [2:0] rn_nready` |
+| `be_dispatch` | `input rob_full` / `input lsq_full` | `input [2:0] rob_nfree` / `input [2:0] lsq_nfree` |
+| `be_rob` | `output rob_full` | `output [2:0] rob_nfree` |
+| `be_dispatch` | — | 新增 `cnt_lost_rob` / `cnt_lost_lsq` / `cnt_lost_iq` |
+
+`be_dispatch` 是三路的交會點：`rn_nready = min(rob_nfree, lsq_eff, ds_nready)`，
+`lsq_eff = mshr_full ? 0 : lsq_nfree`。**三個來源都只看自己的空位數、都不看 valid**，
+所以 `valid↔ready` 不可能成環（CONTRACT v8 規則 2）。
+實測把 TB 的迴路接起來（`ds_nready → rn_nready → ds_valid`）跑 verilator：**無 UNOPTFLAT**。
+
+`mshr_full` 目前仍是 1 bit（監督者的清單沒有列它）。如果 Agent F 要改成
+`mshr_nfree [2:0]`，我這邊只要把 `lsq_eff` 的算式換一行 —— **這點要確認**。
+
+### 9.2 `cnt_st_iq` 的門檻灌水：我自己的模組也有，而且更嚴重
+
+監督者在 LSQ 上量到 99.97% 是假滿。我用同一條標準量自己的 `cnt_st_iq`
+（同一個 TB、同一組 workload、只差 counter 定義）：
+
+| workload | v7「不足 W 格就算滿」 | v8「真的 0 格」 | 假滿比例 |
+|---|---|---|---|
+| lat=1 相依鏈 | 367 | **0** | **100%** |
+| lat=3 相依鏈 | 450 | 326 | 27.6% |
+| 混合相依鏈 | 452 | 336 | 25.7% |
+| 純 DIV | 367 | **0** | **100%** |
+| 純 MUL | 242 | **0** | **100%** |
+
+**三組是 100% 假滿** —— IQ 從頭到尾沒有真的滿過，全部是協定造成的。
+
+### 9.3 順手抓到第二個 bug：`cfg_rob_entries < cfg_commit_width` 會重複 commit
+
+v8 把 `cfg_*` 下限放回 1，第一次跑 `cfg_rob_entries=1` 就炸了：
+**500 拍 retire 528 條**（1 個 entry 的 ROB 不可能每拍 retire 超過 1 條）。
+
+根因：commit 掃描從 head 往前走 `cfg_commit_width` 條，`cfg_rob_entries` 比
+commit width 小的時候 head 會**在同一拍內繞回自己**，而 `rob_v/rob_done` 是暫存器、
+同一拍內還沒更新 → **同一個 entry 被 commit 最多 4 次**（`cmt_valid` 也會送 4 條假的出去，
+rename 的 freelist 會收到 4 次釋放）。
+
+v7.1 因為 all-or-nothing 把 `cfg` 下限鎖在 `W`，這條路徑從來沒被走過。修法是在
+commit 條件加一條「不得超過目前佔用數」：
+
+```verilog
+&& ({{(`ROB_W-2){1'b0}}, cj[2:0]} < rob_cnt)
+```
+
+修後 `cfg_rob_entries=1` 的 retire 從 528 變成 124（500 拍 ÷ 約 4 拍一條 ✓ 合理）。
+
+### 9.4 回歸測試擴充
+
+`backend/run_regress.sh` 現在掃 **`cfg_rob_entries` = 1 / W / MAX/2 / MAX** 四點
+× 11 種 workload（新增 mode 10：LSU 側 partial，`lsq_nfree` 在 1~2 之間跳），
+每一輪都驗：
+
+1. `retired > 0`（抓 head 永久卡住）
+2. `retired` 不因 mask 變大而劣化（抓容量不足掉件）
+3. **`cnt_lost_rob + cnt_lost_lsq + cnt_lost_iq == Σ(想送 − 實際送)`** ← 守恆自檢
+4. `cmt_arf` 端到端逐條比對
+
+TB 的假 rename 改成 v8 要求的 **hold-and-resend**：保留未被接受的 uop 依序重送、
+`valid` 不撤回、每拍補滿到 W 條。守恆檢查就是拿 TB 自己記的
+`Σ(pend_n − 實際收走)` 去對三個 `cnt_lost_*` 的和。
+
+### 9.5 驗收
+
+四種建置（`ROB_N` 64/128 × `PRF_N` 64/256）：
+
+* `verilator --lint-only -Wall` **全部 0 warning**
+* yosys `check -assert` **4/4 模組 0 problems、0 memories**
+* `run_regress.sh` **四種建置全部 PASS**
+* **無組合迴圈**（把 valid↔nready 迴路接起來跑 verilator，無 UNOPTFLAT）
+
+---
+
+## 10. IQ 參數化：age matrix → 配置序號
+
+### 10.1 為什麼先換 age matrix（而不是先量 IPC）
+
+監督者問的是「先換結構還是先量收益」，但這題其實不是取捨 ——
+**`Q²` 的 age matrix 在 `Q=64` 時對序號方案是兩個軸都輸**：
+
+| | age matrix | 配置序號 + 比較鏈 |
+|---|---|---|
+| 狀態 | `Q²` = 4,096 bit | `Q·(ROB_W+1)` = 512 bit |
+| select 每輪的邏輯 | 每個 entry 一次 `Q`-bit AND + OR-reduce → **O(Q²)** | `Q−1` 個 `(ROB_W+1)`-bit 比較器 → **O(Q)** |
+
+我先前說這是「用 gate 換 state」，**那句話是錯的**，在此更正：
+矩陣版的 select 本身就是 `O(Q²)` 閘數，序號版是 `O(Q)`。
+`Q` 從 32 變 64 時矩陣的兩個成本都是 4 倍，序號是 2 倍。
+既然沒有任何一個軸勝出，就沒有「先量 IPC 再決定」的必要 ——
+先量只是拿一個已知被支配的結構去測，還要冒 `IQ_N=64` 時
+`be_iq` 狀態衝到 11,312 bit（比目前全模型 9,869 還多）的風險。
+
+另外一個實務理由：`IQ_N=64` 建不起來的 6 個 `BLKLOOPINIT` 錯誤，
+本來就要把那幾個 unpacked 陣列改成 packed 才能解，而 `e_age` 正好是其中兩行 ——
+換掉它等於順手消掉 1/3 的錯誤。
+
+### 10.2 select 的結構：平衡錦標賽樹（不是線性比較鏈）
+
+第一版我寫成線性鏈（`IQ_N` 個比較器串起來，每輪一條），功能正確、
+回歸與對拍全過，但 **abc 映射慢到不能用**：`IQ32/ROB64` 跑了 30 分鐘還沒完，
+而 age matrix 版同樣配置只要約 6 分鐘。深度 64 的比較鏈對 abc 的結構雜湊很不友善。
+
+改成**平衡錦標賽樹**（深度 `IQ_W`，`IQ_N` 不足 2 的冪的部分補無效項）之後：
+
+| | 線性鏈 | 錦標賽樹 |
+|---|---|---|
+| abc 時間（IQ32/ROB64） | > 30 min（未完成） | **2 min 41 s** |
+| gates | — | **74,173** |
+| issue 序列 | — | 與鏈版 44 組逐拍相同 |
+
+**這是工具時間不是模型成本**（bit-sliced 的工作量看 cell 數不看深度），
+但 `ci/gate_count.sh` 每個配置多跑半小時是所有 agent 都要付的，所以值得改。
+兩個版本我都用同一套逐拍對拍驗過，行為完全一致。
+
+### 10.3 繞回安全性（監督者最擔心的正確性風險）
+
+序號會繞回，比較必須是繞回安全的。關鍵是**活著的 entry 之間序號差有上界**：
+
+> IQ entry A 還沒 issue ⇒ A 沒有 writeback ⇒ A 的 ROB entry 沒完成
+> ⇒ **commit 不可能越過 A**（ROB 是 in-order commit）
+> ⇒ A 之後最多只能再配置 `cfg_rob_entries − 1` 條（配滿就 `rob_nfree=0` 停住）
+> ⇒ **任兩個活著的 IQ entry，序號差 < `cfg_rob_entries` ≤ `ROB_N` = 2^`ROB_W`**
+
+所以序號取 `SW = ROB_W + 1` 位元，半程 `2^ROB_W` 嚴格大於最大差值，
+`older(a,b) = (a − b)[SW−1]`（差值的最高位）就是**精確**的年齡比較，不是近似。
+`flush` 會清掉所有 entry，序號計數器同時歸零，不影響不變式。
+
+### 10.4 驗證：跟 age matrix 版逐拍對拍
+
+光證明不夠。我把舊的矩陣版留成參考實作，兩個版本餵完全相同的刺激，
+**逐拍比對 `iss_valid` 與四條 `iss_robidx`**：
+
+```
+ROB_N=64 : 11 modes × 4 masks = 44 組 → 完全相同
+ROB_N=128: 11 modes × 4 masks = 44 組 → 完全相同
+```
+
+oldest-first 的語意是**逐位元保留**的。
+
+### 10.5 `IQ_N=64` 的「失敗」其實是我的 testbench
+
+換完之後 `IQ_N=64` 的回歸掛掉（相依鏈的 retire 從 169 掉到 10），
+一度以為是繞回。把序號加寬一位**沒有修好**，所以不是繞回。
+
+bisect 出來的門檻是 `IQ_N` 介於 56 和 63 之間 —— 那個數字不是 IQ 的邊界，
+是**我假 rename 的實體暫存器池大小（1..63）**。in-flight 逼近 63 時，
+假 rename 會重用一個**還活著**的實體暫存器，製造出真機器不可能出現的相依。
+真 rename 的 freelist 會在這時候 stall（那正是監督者量到的 rename stall）。
+
+修法是把 TB 的假 rename 換成**真 freelist**：commit 時用 `cmt_prf` 回收，
+沒有空暫存器就不產生新 uop。修完 `IQ_N=64` 的 retire 是 169 ——
+與 `IQ_N=32/48/56` 完全一致。
+
+**DUT 沒有 bug，是測試平台不夠真實。** 記在這裡是因為這類「測試比被測物更早壞掉」
+的情況，很容易被誤判成設計缺陷。
+
+### 10.6 回歸測試的三項強化（含突變測試）
+
+這一輪順手修掉了回歸測試自己的兩個弱點：
+
+1. **單調性斷言改用 `cnt_lost_rob`**：原本要求「ROB 變大 retire 不得變小」，
+   但 `IQ=64/PRF=64/ROB=64` 這種配置下 freelist 會接手當瓶頸，
+   ROB 變大反而更慢 —— 那是**真實的資源失衡不是 bug**。
+   改成「ROB 變大 → **ROB 自己造成的損失**（`cnt_lost_rob`）只能變少」，
+   對其他資源接手免疫。
+2. **加末段存活性檢查**：`cnt_lost_*` 抓不到死結 ——
+   死結時上游拿不到 freelist 就不再要求送，**需求和損失會一起歸零**。
+   所以另外量「最後 100 拍有沒有 commit」。
+3. **突變測試**：我故意在 `be_eu` 注入一條掉件（`robidx==37` 不進 pool），
+   確認回歸會失敗：
+
+```
+突變版 → FAIL mode=2/4/5/7 mask=64 最後 100 拍沒有任何 commit（疑似死結）
+正常版 → 6 種建置（IQ 32/48/64 × ROB 64/128）全部 PASS
+```
+
+**沒有突變測試，我不會發現「存活性檢查」原本是缺的** ——
+第 1 項的改動一度讓回歸對死結完全無感。
+
+### 10.7 狀態量：公式與實測
+
+```
+age matrix 版：Q·(1 + RUOP_W + ROB_W + PRF_N) + Q²            + PRF_N + 48
+配置序號版　：Q·(1 + RUOP_W + ROB_W + PRF_N + SW) + SW        + PRF_N + 48      SW = ROB_W+1
+                                                  ^^^^ seq_ctr 本身（我第一版漏了，被實測抓出來）
+```
+
+| 建置 | age matrix | 配置序號 | 省下 |
+|---|---|---|---|
+| IQ 32 / ROB 64 / PRF 64 | 4,688 | **3,895** | 793 (16.9%) |
+| IQ 32 / ROB 128 / PRF 64 | 4,720 | **3,960** | 760 (16.1%) |
+| IQ 48 / ROB 64 / PRF 64 | 7,744 | **5,783** | 1,961 (25.3%) |
+| IQ 64 / ROB 64 / PRF 64 | 11,312 | **7,671** | 3,641 (32.2%) |
+| IQ 64 / ROB 128 / PRF 64 | 11,440 | **7,800** | 3,640 (31.8%) |
+
+實測值與公式**逐一吻合**（例如 IQ64/ROB128 = `64×120 + 120 = 7,800`）。
+`ref` 那一組（age matrix, IQ32/ROB128）實測 4,720 = `32×112 + 1024 + 112` ✓，
+兩個公式都對得上。
+
+**IQ 32 → 64 的代價**：age matrix 版 +6,624 bit（+141%），
+序號版 **+3,776 bit（+97%）**。換掉之後 `IQ_N=64` 的 `be_iq` 只有 7,671 bit，
+比原本 `IQ_N=32` 的矩陣版（4,688）多 63%，而不是多 141%。
+
+> **但要提醒**：`PRF_N` 一放大，主導項會換人。
+> `e_pend`（wakeup bit-matrix）是 `Q × PRF_N`，在 `IQ 64 / PRF 256` 下是 16,384 bit，
+> 佔 `be_iq` 的 79% —— 那時候 age matrix 省下的 4,096 bit 只是零頭。
+> **IQ 與 PRF 要一起掃的話，先解 wakeup matrix 的尺寸才有意義**，
+> 但它受 CONTRACT §1「不可用 tag CAM」限制，需要監督者裁決才能動。
+
+### 10.8 閘數：實測對照（不是外推）
+
+為了讓「矩陣 O(Q²) vs 序號 O(Q)」有實測依據，我把 age matrix 參考版也做了
+packed 轉換（讓它能建到 `IQ_N=64`，原本卡在 BLKLOOPINIT），做同配置對照：
+
+| 建置 | age matrix | 序號 + 錦標賽樹 | 差 |
+|---|---|---|---|
+| IQ 32 / ROB 128 | 81,262 gates / 4,720 bit | **75,701 / 3,960** | −6.8% gates / −16.1% state |
+| IQ 64 / ROB 64 | 190,314 gates / 11,312 bit | **145,809 / 7,671** | **−23.4% gates / −32.2% state** |
+
+**兩個軸都贏，而且 `Q` 越大贏越多** —— 正是 O(Q²) 與 O(Q) 的差別：
+
+```
+Q 加倍時的閘數成長倍率：  age matrix 2.34x     序號+樹 1.97x
+```
+
+樹版完整量測：
+
+| 建置 | gates | state | abc 時間 |
+|---|---|---|---|
+| IQ 32 / ROB 64 | 74,173 | 3,895 | 161 s |
+| IQ 48 / ROB 64 | 110,557 | 5,783 | 650 s |
+| IQ 64 / ROB 64 | 145,809 | 7,671 | 1,421 s |
+| IQ 32 / ROB 128 | 75,701 | 3,960 | 178 s |
+| IQ 64 / ROB 128 | 148,978 | 7,800 | 1,577 s |
+
+閘數增量 IQ 32→48→64 是 **+36,384 / +35,252**，每個 entry 約 +2,270 gates，
+線性得非常乾淨。狀態全部與 §10.7 的公式逐一吻合。
+
+> `abc` 時間隨 `Q` 成長得比線性快（161s → 1,421s）。這是合成工具成本不是模型成本，
+> 但若之後要常態掃 IQ 尺寸，**`IQ_N=64` 的 `gate_count.sh` 一次要 20 分鐘以上**，
+> 排 CI 時要把這個算進去。
+
+`IQ_N=64` 的逐拍對拍也做了（樹版 vs age matrix 版，44 組完全相同），
+所以 oldest-first 的等價性在 `Q=32` 與 `Q=64` 兩端都有實證。

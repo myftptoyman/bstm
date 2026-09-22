@@ -39,16 +39,23 @@ module ooo_top (
     output wire [47:0]              cnt_st_backpressure, // v6: 有能力但下游不收
     output wire [47:0]              cnt_st_refill,       // v6: flush 後 decode queue 重填
     output wire [47:0]              cnt_mispred,
+    output wire [47:0]              cnt_lost_fetch,      // v8: 損失的 uop-slot
+    output wire [47:0]              cnt_lost_refill,
+    output wire [47:0]              cnt_lost_rename,
+    output wire [47:0]              cnt_lost_backpressure,
+    output wire [47:0]              cnt_lost_lsq,
+    output wire [47:0]              cnt_lost_iq,
+    output wire [47:0]              cnt_lost_rob,
     output wire [47:0]              cnt_rob_occ_sum  // 除以 cycles = 平均佔用
 );
     // ================= inter-module wires =================
     wire [`W-1:0]         de_valid;   wire [`W*`DUOP_W-1:0] de_duop;
-    wire                  de_ready;
+    wire [2:0]            de_nready;
     wire [`W-1:0]         rn_valid;   wire [`W*`RUOP_W-1:0] rn_ruop;
-    wire                  rn_ready;
+    wire [2:0]            rn_nready;
     wire [`W-1:0]         ds_valid;   wire [`W*`RUOP_W-1:0] ds_ruop;
     wire [`W*`ROB_W-1:0]  ds_robidx;
-    wire                  ds_ready;
+    wire [2:0]            ds_nready;
 
     wire [`W-1:0]         iss_valid;  wire [`W*`RUOP_W-1:0] iss_ruop;
     wire [`W*`ROB_W-1:0]  iss_robidx;
@@ -66,8 +73,9 @@ module ooo_top (
     wire [`W*`ROB_W-1:0]  lsu_req_rob;
     wire [`W-1:0]         lsu_done_v; wire [`W*`ROB_W-1:0] lsu_done_rob;
     wire [`W*`PRF_W-1:0]  lsu_done_prf;
-    wire                  lsq_full, mshr_full;
-    wire                  rob_full;   // v3: ROB backpressure
+    wire [2:0]            lsq_nfree;
+    wire                  mshr_full;
+    wire [2:0]            rob_nfree;  // v8: ROB 可收幾條
 
     wire [`PRF_N-1:0]     prf_ready;   // scoreboard，供 IQ wakeup
 
@@ -78,32 +86,36 @@ module ooo_top (
         .fb_valid(fb_valid), .fb_duop(fb_duop), .fb_fe_event(fb_fe_event),
         .fb_take(fb_take), .fb_redirect(fb_redirect), .fb_redir_shadow(fb_redir_shadow),
         .mispred_in(flush),
-        .de_valid(de_valid), .de_duop(de_duop), .de_ready(de_ready),
-        .cnt_st_fetch(cnt_st_fetch), .cnt_st_refill(cnt_st_refill), .cnt_mispred(cnt_mispred)
+        .de_valid(de_valid), .de_duop(de_duop), .de_nready(de_nready),
+        .cnt_st_fetch(cnt_st_fetch), .cnt_st_refill(cnt_st_refill),
+        .cnt_lost_fetch(cnt_lost_fetch), .cnt_lost_refill(cnt_lost_refill),
+        .cnt_mispred(cnt_mispred)
     );
 
     rn_rename u_rn (
         .clk(clk), .rst(rst), .flush(flush),
-        .de_valid(de_valid), .de_duop(de_duop), .de_ready(de_ready),
-        .rn_valid(rn_valid), .rn_ruop(rn_ruop), .rn_ready(rn_ready),
+        .de_valid(de_valid), .de_duop(de_duop), .de_nready(de_nready),
+        .rn_valid(rn_valid), .rn_ruop(rn_ruop), .rn_nready(rn_nready),
         .cmt_valid(cmt_valid), .cmt_dv(cmt_dv), .cmt_arf(cmt_arf), .cmt_prf(cmt_prf),
-        .cnt_st_rename(cnt_st_rename), .cnt_st_backpressure(cnt_st_backpressure)
+        .cnt_st_rename(cnt_st_rename), .cnt_st_backpressure(cnt_st_backpressure),
+        .cnt_lost_rename(cnt_lost_rename), .cnt_lost_backpressure(cnt_lost_backpressure)
     );
 
     // ================= Agent E =================
     be_dispatch u_ds (
         .clk(clk), .rst(rst), .flush(flush),
         .cfg_rob_entries(cfg_rob_entries),
-        .rn_valid(rn_valid), .rn_ruop(rn_ruop), .rn_ready(rn_ready),
-        .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx), .ds_ready(ds_ready),
-        .lsq_full(lsq_full), .rob_full(rob_full), .mshr_full(mshr_full),
-        .cnt_st_rob(cnt_st_rob), .cnt_st_lsq(cnt_st_lsq)
+        .rn_valid(rn_valid), .rn_ruop(rn_ruop), .rn_nready(rn_nready),
+        .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx), .ds_nready(ds_nready),
+        .lsq_nfree(lsq_nfree), .rob_nfree(rob_nfree), .mshr_full(mshr_full),
+        .cnt_st_rob(cnt_st_rob), .cnt_st_lsq(cnt_st_lsq),
+        .cnt_lost_lsq(cnt_lost_lsq), .cnt_lost_rob(cnt_lost_rob), .cnt_lost_iq(cnt_lost_iq)
     );
 
     be_iq u_iq (
         .clk(clk), .rst(rst), .flush(flush),
         .cfg_iq_entries(cfg_iq_entries), .cfg_issue_width(cfg_issue_width),
-        .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx), .ds_ready(ds_ready),
+        .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx), .ds_nready(ds_nready),
         .prf_ready(prf_ready),
         .iss_valid(iss_valid), .iss_ruop(iss_ruop), .iss_robidx(iss_robidx),
         .cnt_st_iq(cnt_st_iq)
@@ -123,7 +135,7 @@ module ooo_top (
         .cfg_rob_entries(cfg_rob_entries), .cfg_commit_width(cfg_commit_width),
         .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx),
         .wb_valid(wb_valid), .wb_robidx(wb_robidx),
-        .flush(flush), .flush_robidx(flush_robidx), .rob_full(rob_full),
+        .flush(flush), .flush_robidx(flush_robidx), .rob_nfree(rob_nfree),
         .cmt_valid(cmt_valid), .cmt_dv(cmt_dv), .cmt_arf(cmt_arf), .cmt_prf(cmt_prf),
         .cnt_cycles(cnt_cycles), .cnt_retired(cnt_retired),
         .cnt_wrongpath(cnt_wrongpath), .cnt_rob_occ_sum(cnt_rob_occ_sum)
@@ -135,7 +147,7 @@ module ooo_top (
         .cfg_ldq_entries(cfg_ldq_entries), .cfg_stq_entries(cfg_stq_entries),
         .ds_valid(ds_valid), .ds_ruop(ds_ruop), .ds_robidx(ds_robidx),
         .req_v(lsu_req_v), .req_rob(lsu_req_rob), .req_ev(lsu_req_ev),
-        .lsu_ready(lsu_ready), .lsq_full(lsq_full),
+        .lsu_ready(lsu_ready), .lsq_nfree(lsq_nfree),
         .mshr_full(mshr_full),
         .done_v(lsu_done_v), .done_rob(lsu_done_rob), .done_prf(lsu_done_prf),
         .fb_mem_event(fb_mem_event),

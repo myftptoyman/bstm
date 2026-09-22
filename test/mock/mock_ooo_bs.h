@@ -8,10 +8,11 @@
 #include "bstm_types.h"
 #include "bstm_abi.h"
 
-#define MOCK_NCNT 11
+#define MOCK_NCNT 12
 
 typedef struct {
     vec_t occ[7];
+    vec_t occ_cp[7];
     vec_t in_shadow;
     vec_t shadow_cnt[6];
     vec_t cnt[MOCK_NCNT][BSTM_CNT_W];

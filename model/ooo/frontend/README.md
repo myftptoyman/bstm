@@ -6,7 +6,7 @@
 | `rename/rn_rename.v`  | `rn_rename` | RAT + committed-RAT + freelist，4-wide rename |
 
 埠列由監督者凍結，本次只填 body。語言 Verilog-2005，遵守 `CONTRACT.md §1` 五條硬規則。
-介面版本：**ifc.vh v3 + PRF 參數化**（`RUOP_W` 40 bit，新增 `RUOP_ARFD/ARFDV`；commit 送新 mapping
+介面版本：**ifc.vh v3 + PRF/ROB 參數化 + v8 partial accept**（`RUOP_W` 40 bit，新增 `RUOP_ARFD/ARFDV`；commit 送新 mapping
 `cmt_prf`；ready 為 all-or-nothing）。
 
 ---
@@ -18,8 +18,8 @@
 
 | top | cells | memories | latch | state bits |
 |---|---|---|---|---|
-| `fe_front`  | 480  | **0** | 無 | 666（dq 512 + 控制 10 + counter 144）|
-| `rn_rename` | 4789 | **0** | 無 | 608 宣告 / 594 實際（x0 的 RAT entry 與 phys0 的 freelist 位元是常數，被折掉）|
+| `fe_front`  | 525  | **0** | 無 | 762（dq 512 + 控制 10 + counter 240）|
+| `rn_rename` | 4834 | **0** | 無 | 704 宣告 / 690 實際（x0 的 RAT entry 與 phys0 的 freelist 位元是常數，被折掉）|
 
 `RUOP` v3（32 → 40 bit）對 cell 數**零影響**（4761 → 4761，只多 32 條 wire bit）：
 新欄位是 `DUOP_D/DUOP_DV` 的純接線複製，沒有新增任何邏輯。
@@ -227,6 +227,140 @@ T11 是這條規則要的形式 —— 它驗的是**能真的配出多少個實
 `fe_front` 的 666 = decode queue 16x32 + 控制 10（`dq_cnt_q` 5 + bub 2 + blk_seen 1
 + shadow 1 + refill 1）+ 三個 48-bit counter，**與 PRF/ROB 尺寸無關**，
 兩個 config 逐位相同。
+
+---
+
+## 1d. CONTRACT v8：partial accept
+
+```verilog
+// fe_front
+input  wire [2:0] de_nready;     // 下游這拍能收前 N 條
+// rn_rename
+output wire [2:0] de_nready;     // 我這拍能收前 N 條
+input  wire [2:0] rn_nready;     // 下游這拍能收前 N 條
+```
+
+### 為什麼 bundle 內旁路**不需要改**：接受是前綴
+
+這是整個改動的關鍵性質。規則 1 規定「接受的一定是最前面的 n 條」，所以：
+
+```
+lane j 被接受  =>  所有 i < j 也被接受
+```
+
+而 bundle 內旁路只會「lane j 旁路自 lane i < j」。因此**對每個被接受的 lane，
+它的旁路來源全部也被接受** —— 原本整組一起送時算出來的 `ps1_j / ps2_j / p_j`
+對前綴而言逐位不變。要改的只有「提交」那一層：
+
+```verilog
+wire w0 = acc[0] & nd0;    // acc[j] = (j < n_xfer)
+...                        // 只有真的送出去的 lane 才配暫存器、才寫 RAT
+```
+
+配額序號 `sl_j`（前面有幾條要配）也一樣：它只數 lane i < j，而那些都被接受了。
+
+### 監督者問的兩個問題
+
+**Q1：保留下來的 uop 的架構映射是重新查 RAT 還是沿用上一拍？**
+→ **重新查，而且必須重新查。**
+`rn_rename` 是純組合查表（RN 沒有自己的 pipeline register，見 §3.5），
+沒被接受的 uop 根本沒離開 `fe_front` 的 decode queue。下一拍 queue 壓縮移位，
+它們出現在 lane 0.. 重新查 `rat_q` —— 而 `rat_q` 此時已經含有上一拍被接受的
+lane 的寫入。舉例：
+
+```
+拍 T   lanes [A B C D]，n_xfer=2      -> A,B 被接受，A,B 的 mapping 在時鐘邊緣寫進 RAT
+拍 T+1 lanes [C D E F]（queue 移 2）  -> C 讀 RAT（已含 A,B 的寫入）✓
+                                        D 旁路自 C（同拍 lane 0）✓ 程式順序正確
+```
+「沿用上一拍算好的值」在 C 相依於 A/B 時**也會得到同一個值**（RAT 裡就是那個值），
+但在 C 相依於 D 之後的東西時會錯 —— 所以統一重新查，不做任何跨拍快取。
+
+**Q2：上一拍有沒有替沒送出的 lane 預先配實體暫存器？**
+→ **沒有。`freelist` 位元只在 lane 真的送出時才清。**
+`p_j` 是組合算出來的候選值，但 `alloc_mask` 只包含 `w_j = acc[j] & nd_j`。
+沒被接受的 lane 下一拍會重新走一次 pick（拿到的號碼可能相同也可能不同，
+反正下游沒看過它），**不會洩漏也不會重複配**。
+T17 就是守這件事的指紋測試：讓 `nready` 在 1~3 之間變動地跑到 freelist 耗盡，
+可配出的總數必須仍然是 `PRF_N - 32`（64 → 32，256 → 224）。
+若沒送出的 lane 也清了 freelist 位元，這個數字會變小。
+
+### 規則 2（`nready` 不得依賴 `valid`）
+
+```verilog
+wire [TCW-1:0] n_free = ffd[0]+ffd[1]+ffd[2]+ffd[3];   // 只看 freelist 自己
+assign de_nready = (n_free < rn_nready) ? n_free : rn_nready;
+```
+
+`de_nready` 只由 **freelist 狀態**與 **下游的 `rn_nready`** 決定，完全不看 `de_valid`
+或 `de_duop`。`rn_valid` 也不看 `rn_nready`（`rn_valid = thermometer(min(want, n_free))`），
+所以 valid 與 nready 之間沒有任何方向的組合相依。
+四種建置的 `verilator --lint-only -Wall` 都 **0 warning、UNOPTFLAT = 0**。
+
+**已知的保守性**：`de_nready` 必須假設「每條 uop 都要配一個實體暫存器」，
+因為它不准看 `de_duop`。所以當進來的是 store/branch（不寫暫存器）時，
+rename 會低報自己的容量。這是規則 2 的必然代價，不是 bug；
+要消除它就得讓 `nready` 看 `valid`，那會立刻形成組合迴圈。
+
+### 三方對 `n_xfer` 的一致性（跨模組相依，請監督者留意）
+
+```
+fe_front : 出隊 = min(n_pres, de_nready)
+rn_rename: 配置/寫 RAT 的 lane 數 n_xfer = min(want, n_free, rn_nready)
+be_dispatch: 取用 = min(popcount(rn_valid), rn_nready)
+```
+因為 `rn_valid = thermometer(min(want, n_free))` 且 `de_nready = min(n_free, rn_nready)`，
+三個式子恆等。**如果 `be_dispatch` 取的比 `min(popcount(rn_valid), rn_nready)` 少**
+（例如自己再丟掉 wrong-path uop），rename 就會替沒被收下的 uop 配了暫存器 →
+下一拍那條 uop 重新進來再配一次 → **實體暫存器洩漏**。
+規則 4 必須被下游嚴格遵守，這條相依建議寫進契約的跨模組相依清單。
+
+### stall 歸因（§8 v2）
+
+| 埠 | 定義 | 單位 |
+|---|---|---|
+| `cnt_st_fetch` | `de_nready != 0 & n_pres == 0 & ~refill_q & ~flush` | 拍 |
+| `cnt_st_refill` | 同上但 `refill_q` | 拍 |
+| `cnt_lost_fetch` | `de_nready - n_out`（下游開的名額沒填滿），`~refill_q` | uop-slot |
+| `cnt_lost_refill` | 同上但 `refill_q` | uop-slot |
+| `cnt_st_rename` | `want>0 & n_xfer==0 & n_free==0 & ~flush` | 拍 |
+| `cnt_st_backpressure` | `want>0 & n_xfer==0 & n_free>0 & ~flush` | 拍 |
+| `cnt_lost_rename` | `want - min(want, n_free)` | uop-slot |
+| `cnt_lost_backpressure` | `min(want, n_free) - n_xfer` | uop-slot |
+
+守恆律（可用來驗證歸因沒有重複或漏算）：
+
+```
+cnt_lost_rename + cnt_lost_backpressure == Σ(want - n_xfer)      每拍成立
+cnt_st_rename   + cnt_st_backpressure   == 完全停擺的拍數          互斥
+cnt_st_fetch    + cnt_st_refill         == 前端完全交不出東西的拍數  互斥
+```
+
+歸因順序仍是「先算自己的資源、再算下游」（監督者已裁決；若重疊很大要加第三個
+bucket 而不是改優先序）。
+
+### 指紋數字（會隨條件改變，抓得到「跑到舊 binary」）
+
+| 測試 | PRF_N=64 | PRF_N=256 | 抓什麼 |
+|---|---|---|---|
+| T11 flush 後可配總數 | 32 | 224 | PRF 容量（不只寬度）|
+| T17 `nready` 1~3 變動下可配總數 | 32 | 224 | **partial 下的實體暫存器洩漏** |
+| T15 `cfg_fetch_width` 1/2/3/4 交付數 | 20/40/60/80 | 20/40/60/80 | cfg 下限回到 1 可用 |
+| T16 `nready`=4/3/2/1 的 dst | p7 p9 p32 p33（四者相同）| — | **partial 下的 bundle 旁路** |
+| T12 `lost_backpressure` | 精確 +20（4 條 x 5 拍）| — | lost 計數的精確性 |
+
+### 四種建置（`ROB_N` 64/128 x `PRF_N` 64/256）
+
+| 建置 | lint fe/rn | UNOPTFLAT | 功能 | fe gates/flops | rn gates/flops |
+|---|---|---|---|---|---|
+| ROB 64 / PRF 64 | 0 / 0 | 0 | 17/17 PASS | 5593 / 762 | 13538 / 690 |
+| ROB 128 / PRF 64 | 0 / 0 | 0 | 17/17 PASS | 5593 / 762 | 13538 / 690 |
+| ROB 64 / PRF 256 | 0 / 0 | 0 | 17/17 PASS | 5593 / 762 | 34836 / 1198 |
+| ROB 128 / PRF 256 | 0 / 0 | 0 | 17/17 PASS | 5593 / 762 | 34836 / 1198 |
+
+flop 公式更新為 `rn = 62*PRF_W + 2*PRF_N + 190`（四個 48-bit counter），
+`fe = 762`（固定；五個 48-bit counter + decode queue 512 + 控制 10），
+四種建置實測逐一吻合。ROB 尺寸對本目錄**完全沒有影響**（兩個模組不引用 `` `ROB_* ``）。
 
 ---
 

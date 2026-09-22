@@ -62,22 +62,27 @@
 `define DUOP_D          4:0      // 架構暫存器低 5 bit（demo 只用 x0..x31）
 
 // ---- rename 後的 uop ----
-`define RUOP_W  40          // v3: 32->40，高 8 bit 新增架構暫存器編號
-`define RUOP_WRONGPATH  31
-`define RUOP_CLASS      30:27
-`define RUOP_LAT        26:23
-`define RUOP_S1V        22
-`define RUOP_S1         21:16     // phys reg
-`define RUOP_S2V        15
-`define RUOP_S2         14:9
-`define RUOP_DV         8
-`define RUOP_D          7:2       // phys reg
-`define RUOP_MEMSTORE   1
+// v4：實體暫存器欄位改為由 `PRF_W 推導。
+//   v3 以前 RUOP_S1/S2/D 是寫死的 6 bit（21:16 / 14:9 / 7:2），而 rename 端寫入的
+//   是 `PRF_W 寬的值 —— PRF_N>64 時高位被 Verilog 靜默截斷，實體暫存器編號發生
+//   別名，整條 rename→IQ→EU→ROB 的相依鏈全錯。lint 不會報，free list 自測也過
+//   （它只查 free list），只有跑真 trace 才會看到 LSQ 永久 full。
+//   因此所有多位元欄位一律用 `+: 寬度` 存取，不再用 [hi:lo]。
 `define RUOP_SERIALIZE  0
-// ---- v3 新增（bit[31:0] 佈局完全不變，只往高位長）----
-`define RUOP_ARFD       36:32     // 架構目的暫存器 x0..x31，供 ROB 產生 cmt_arf
-`define RUOP_ARFDV      37        // 架構目的暫存器 valid
-// bit 38..39 保留
+`define RUOP_MEMSTORE   1
+`define RUOP_D          2                      // +: `PRF_W
+`define RUOP_DV         (2 + `PRF_W)
+`define RUOP_S2         (3 + `PRF_W)           // +: `PRF_W
+`define RUOP_S2V        (3 + 2*`PRF_W)
+`define RUOP_S1         (4 + 2*`PRF_W)         // +: `PRF_W
+`define RUOP_S1V        (4 + 3*`PRF_W)
+`define RUOP_LAT        (5 + 3*`PRF_W)         // +: `LAT_W
+`define RUOP_CLASS      (5 + `LAT_W + 3*`PRF_W)// +: `UC_W
+`define RUOP_WRONGPATH  (5 + `LAT_W + `UC_W + 3*`PRF_W)
+`define RUOP_ARFD       (6 + `LAT_W + `UC_W + 3*`PRF_W)   // +: `RUOP_ARFD_W
+`define RUOP_ARFD_W     5                      // 架構目的暫存器 x0..x31
+`define RUOP_ARFDV      (6 + `LAT_W + `UC_W + `RUOP_ARFD_W + 3*`PRF_W)
+`define RUOP_W          (7 + `LAT_W + `UC_W + `RUOP_ARFD_W + 3*`PRF_W)
 
 
 // ---- commit 介面語意（v2，2026-09-21 監督者裁決）----

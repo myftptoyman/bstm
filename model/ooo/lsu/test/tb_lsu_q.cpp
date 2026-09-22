@@ -62,6 +62,11 @@ struct Result {
     long miss_done = 0;       // 只算真的 miss（load/AMO 且 level!=0）
     long max_lat = 0;
     long lat_violations = 0;  // 實測延遲 < base latency 的次數
+    long wanted = 0, sent = 0;    // v8: 想送 / 實際送（uop 數）
+    long lost = 0;                // = wanted - sent，等同 cnt_lost_lsq
+    long full_cycles = 0;         // nfree==0 且有東西要送 -> 完全停擺
+    long gain_b_lb = 0;           // 選項 (b) 能多收的 uop 數（可證明的下界）
+    long max_inflight_mem = 0;    // fb_take 與 ds_valid 之間在飛的 mem uop 峰值
     bool hang = false;
 };
 
@@ -145,28 +150,46 @@ static Result run(int cfg_ldq, int cfg_stq, int mix, long max_cycles,
             dut->fb_take = take;
         }
 
-        // ---- dispatch 側（受 lsq_full 反壓；整組收）----
+        // ---- dispatch 側（v8 partial accept：依序收前 nfree 條）----
         dut->ds_valid = 0; dut->ds_robidx = 0;
         memset(&dut->ds_ruop, 0, sizeof(dut->ds_ruop));
-        bool can_disp = !dut->lsq_full && decode_pipe.size() >= 1
-                        && (int)inflight.size() + L_W < L_ROB_N - 4;
-        std::vector<Uop> dispatched;
-        if (can_disp) {
-            for (int l = 0; l < L_W && !decode_pipe.empty(); l++) {
-                Uop u = decode_pipe.front();
-                // rob 必須在 in-flight 中唯一
-                // rob 必須在 in-flight 中唯一，且與上次使用隔開足夠距離
-                if (u.is_mem && (inflight.count(u.rob) || cyc < rob_free_at[u.rob])) break;
-                decode_pipe.pop_front();
-                dut->ds_valid |= (1u << l);
-                wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_CLASS_LSB,
-                        L_RUOP_CLASS_W, u.cls);
-                wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_D_LSB,
-                        L_RUOP_D_W, u.prf);
-                wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_DV_LSB, 1, 1);
-                wr_nar(dut->ds_robidx, l * L_ROB_W, L_ROB_W, u.rob);
-                dispatched.push_back(u);
+        int nfree = dut->lsq_nfree;
+        // 上游「想送」的條數：bundle 前綴，受 ROB 空間與 rob 重用距離限制
+        int want = 0;
+        for (int l = 0; l < L_W && l < (int)decode_pipe.size(); l++) {
+            const Uop& u = decode_pipe[l];
+            if ((int)inflight.size() + want >= L_ROB_N - 4) break;
+            if (u.is_mem && (inflight.count(u.rob) || cyc < rob_free_at[u.rob])) break;
+            want++;
+        }
+        int nsend = (want < nfree) ? want : nfree;
+        if (want > 0) {
+            R.wanted += want; R.sent += nsend; R.lost += want - nsend;
+            if (nfree == 0) R.full_cycles++;
+            // 選項 (b)（看 bundle 組成）能多收多少 —— 可證明的下界：
+            //   ld_free >= nfree 且 st_free >= nfree，所以只要前綴裡的 load 數
+            //   與 store 數都 <= nfree，這個前綴就「一定」放得下。
+            int nl = 0, ns = 0, nb = 0;
+            for (int l = 0; l < want; l++) {
+                const Uop& u = decode_pipe[l];
+                if (u.cls == UC_LOAD  || u.cls == UC_AMO) nl++;
+                if (u.cls == UC_STORE || u.cls == UC_AMO) ns++;
+                if (nl <= nfree && ns <= nfree) nb = l + 1; else break;
             }
+            if (nb > nsend) R.gain_b_lb += nb - nsend;
+        }
+        std::vector<Uop> dispatched;
+        for (int l = 0; l < nsend; l++) {
+            Uop u = decode_pipe.front();
+            decode_pipe.pop_front();
+            dut->ds_valid |= (1u << l);
+            wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_CLASS_LSB,
+                    L_RUOP_CLASS_W, u.cls);
+            wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_D_LSB,
+                    L_RUOP_D_W, u.prf);
+            wr_wide(dut->ds_ruop, l * L_RUOP_W + L_RUOP_DV_LSB, 1, 1);
+            wr_nar(dut->ds_robidx, l * L_ROB_W, L_ROB_W, u.rob);
+            dispatched.push_back(u);
         }
 
         // ---- EU 側：把 req 驅動上去（上一拍決定的）----
@@ -225,8 +248,13 @@ static Result run(int cfg_ldq, int cfg_stq, int mix, long max_cycles,
             }
         }
 
-        size_t in_delay = 0;
-        for (const auto& v : delay_line) in_delay += v.size();
+        size_t in_delay = 0, mem_inflight = 0;
+        for (const auto& v : delay_line) {
+            in_delay += v.size();
+            for (const Uop& u : v) if (u.is_mem) mem_inflight++;
+        }
+        for (const Uop& u : decode_pipe) if (u.is_mem) mem_inflight++;
+        if ((long)mem_inflight > R.max_inflight_mem) R.max_inflight_mem = mem_inflight;
         if (fetch_p >= prog.size() && inflight.empty() && decode_pipe.empty()
             && eu_mq.empty() && in_delay == 0 && pend_req.empty()) break;
         cyc++;
@@ -248,23 +276,28 @@ int main(int argc, char** argv) {
            L_ROB_N, L_ROB_W, L_PRF_N, L_PRF_W, L_LDQ_N, L_LSQ_W, L_MSHR_N);
 
     // ---- T5：cfg_ldq / cfg_stq 的 最小 / 中間 / MAX 三點 ----
-    int pts[3] = { 1, L_LDQ_N / 2, L_LDQ_N };
-    long thr[3];
-    for (int i = 0; i < 3; i++) {
+    const int NP = 5;
+    int pts[NP] = { 1, 2, 3, L_LDQ_N / 2, L_LDQ_N };
+    long thr[NP];
+    for (int i = 0; i < NP; i++) {
         char ctx[64]; snprintf(ctx, sizeof ctx, "cfg_ldq=cfg_stq=%d mix=hit", pts[i]);
         Result r = run(pts[i], pts[i], 0, 200000, 4000, ctx);
         thr[i] = r.done * 1000 / (r.cycles ? r.cycles : 1);
-        printf("    cfg=%-2d  cycles=%-6ld done=%-5ld thr=%ld.%03ld/cyc  st_mshr=%ld  latviol=%ld\n",
+        printf("    cfg=%-2d cyc=%-6ld done=%-5ld thr=%ld.%03ld  lost=%-5ld full_cyc=%-5ld"
+               " gain_b>=%-4ld memflight=%-3ld latviol=%ld\n",
                pts[i], r.cycles, r.done, thr[i] / 1000, thr[i] % 1000,
-               r.mshr_stall, r.lat_violations);
-        CHECK(r.done > 0, "no completions", ctx);
+               r.lost, r.full_cycles, r.gain_b_lb, r.max_inflight_mem, r.lat_violations);
+        CHECK(r.done > 0, "no completions (cfg too small to make progress?)", ctx);
         CHECK(r.lat_violations == 0, "latency below base (mem-event misaligned?)", ctx);
+        CHECK(r.max_inflight_mem < 32, "mem-event FIFO invariant broken (>= MQN)", ctx);
         // T4a：全 L1 hit 不該有 MSHR stall
         CHECK(r.mshr_stall == 0, "cnt_st_mshr != 0 on all-L1-hit", ctx);
     }
     // 吞吐不得隨 mask 變大而劣化（CONTRACT v7 §10.3）
-    CHECK(thr[1] >= thr[0], "throughput regressed cfg min -> mid", "monotonic");
-    CHECK(thr[2] >= thr[1], "throughput regressed cfg mid -> MAX", "monotonic");
+    for (int i = 1; i < NP; i++) {
+        char c2[64]; snprintf(c2, sizeof c2, "monotonic cfg %d -> %d", pts[i-1], pts[i]);
+        CHECK(thr[i] >= thr[i-1], "throughput regressed as mask grew", c2);
+    }
 
     // ---- T3 / T4b：全 DRAM，MSHR 是 MLP 上限 ----
     {

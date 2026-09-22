@@ -144,14 +144,14 @@ miss），只佔一個 entry。demo 沒有位址，無從判斷是否同 line，
 
 ## 5. 介面約定（給 Agent E / 監督者）
 
-- **`lsq_full`**：保守訊號，代表「整組 W=4 條 dispatch 不保證放得下」。
-  `be_dispatch` 是 all-or-nothing 收，所以這樣才安全。
-  **因此 `cfg_ldq_entries` / `cfg_stq_entries` 必須 >= W(4)**，
-  否則會永遠 full（模型會停住）。
+- **`lsq_nfree` [2:0]**（v8 取代 `lsq_full`）：「我這拍能收 bundle 最前面的幾條」，
+  `= min(ld_free, st_free, `W)`，只看本模組的暫存器狀態。
+  `be_dispatch` 送出數 = `min(popcount(ds_valid), lsq_nfree)`，且必須**依序、不可跳號**，
+  未被接受的 uop 要保留並依序重送。詳見 §5c。
 - **`lsu_ready`**：`be_eu` 會把 pop 決定暫存一拍，所以 ready 只在請求緩衝
   全空時拉高；緩衝深度 8 足以吸收「ready 慢一拍」造成的兩個連續 burst
   （最壞佔用 6）。**`lsu_ready` 不受 MSHR 滿影響** —— MSHR 的反壓是靠
-  LDQ 塞滿 → `lsq_full` → dispatch stall 這條路徑，這才是真正的 MLP 限制機制。
+  LDQ 塞滿 → `lsq_nfree` 變小 → dispatch 節流這條路徑，這才是真正的 MLP 限制機制。
 - **`done_v[3:0]`**：lane 0/1 = L1-hit 延遲線，lane 2/3 = MSHR
   （= 2 個 return bus，每拍最多 2 個 miss 回報）。
 - **`done_prf`**：直接是該 uop 的 `RUOP_D`。埠列**沒有 `done_dv`**，
@@ -226,22 +226,79 @@ gate 數在雜訊內：12,743 → 12,748）。兩者在 `lsu_q` 都不是結構�
 
 ---
 
-## 5c. `cfg_*` 的可表示下限（契約層面的觀察，請監督者裁決）
+## 5c. `lsq_nfree`：partial accept（CONTRACT v8 §6 v2）
 
-CONTRACT §3 寫 `cfg_ldq_entries` 範圍是 ``1..`LDQ_N``，但 CONTRACT v2 同時裁決
-**所有 `*_ready` 是 all-or-nothing、不支援 partial accept**。這兩條有衝突：
+```verilog
+output wire [2:0] lsq_nfree;   // 這拍能收 bundle 最前面的幾條，0..`W
+```
 
-一組 dispatch 最多有 `` `W `` 條記憶體 uop，而 `be_dispatch` 要嘛整組收、要嘛整組不收。
-所以只要 `cfg_ldq_entries < ` `` `W ``，`lsq_full` 就永遠拉高 → 模型不前進。
-**小於 `` `W `` 的 LSQ 在這個協定下無法表示。**
+`lsq_nfree = min(ld_free, st_free, `W)`，**只看本模組自己的暫存器**
+（`ld_cnt`/`st_cnt`/`cfg_*`），不看 `ds_valid`、也不看 `ds_ruop` ——
+符合規則 2（防 valid↔ready 組合迴圈）。
 
-本模組的處理：把 `ld_max` / `st_max` 夾在 `` [`W, `LDQ_N] `` —— 夾住而不是掛掉，
-這樣 CONTRACT v7 §10.1 要求的「cfg 掃到最小值」不會讓模型停住（實測 cfg=1 與 cfg=4
-行為相同、都正常前進）。
+### 為什麼選 (a) 保守值：它是這個前提下的**唯一緊界**，不是偷懶
 
-**建議二選一：**
-1. §3 把 LDQ/STQ 的範圍改成 ``\`W..`LDQ_N``，或
-2. `lsq_full` 改成能表達 partial accept（要動 `be_dispatch` 與 ready 語意）
+監督者給的選項是 (a) `min(ld_free, st_free, `W)` 對 (b) 依 bundle 組成算。
+在「不得依賴 `valid`/`duop`」的前提下，**(a) 已經是可能的最大值**：
+
+- 一條記憶體 uop 可能要 LDQ（load）、要 STQ（store）、或**兩者都要**（AMO）
+- 所以長度 `N` 的前綴，最壞情況會吃掉 `N` 個 LDQ **且** `N` 個 STQ
+- 任何 `N > min(ld_free, st_free)` 的承諾，都能被「`N` 條全是 load」或
+  「`N` 條全是 store」的 bundle 打爆 → 就會違反規則 1（依序接受、不可跳號）
+
+也就是說 (a) 不是「簡單但低估」，而是**看不到 bundle 就不可能更好**。
+要更精確就一定得看 bundle 組成，那正是規則 2 禁止的。
+
+`ld_free`/`st_free` 用的是**上個 cycle 結尾的**佔用值（本拍的 dealloc 還沒算進去），
+所以是真實空位數的下界 —— 只會少承諾、不會多承諾，安全方向正確。
+
+### (b) 還能多收多少：實測（可證明的下界）
+
+我在自測裡量了這個差距。方法是可證明的下界，不需要窺探模組內部：
+因為 `ld_free >= nfree` 且 `st_free >= nfree`，所以只要某個前綴裡
+**load 數與 store 數都 <= nfree**，那個前綴就**一定**放得下。
+
+| cfg_ldq=cfg_stq | `lost`（= `cnt_lost_lsq`） | (b) 至少能多收 | 比例 |
+|---|---:|---:|---:|
+| 1 | 89,347 | 12,123 | ≥ 14% |
+| 2 | 37,154 | 7,225 | ≥ 19% |
+| 3 | 22,358 | 5,651 | ≥ 25% |
+| 8 | 819 | 548 | ≥ 67% |
+| 16 (MAX) | 75 | 32 | ≥ 43% |
+| 16 (MAX, ROB=128) | 4,680 | 2,267 | ≥ 48% |
+
+（真實值比這更高，因為下界只用了 `nfree` 而不是實際的 `ld_free`/`st_free`。）
+
+**解讀：** partial accept 把絕大多數損失吃掉了 —— cfg=16 時 `lost` 只剩 75 個
+uop-slot（全程 3,224 拍）。剩下那一點裡有 ~一半是 (a) 的保守造成的，
+絕對量很小。**但 ROB 放大到 128 之後 `lost` 跳到 4,680**，LSQ 重新變成瓶頸，
+這時 (b) 的 ~2,267 就不再可以忽略。
+
+**建議**：現在維持 (a)。如果 ROB sweep 確認 128-entry ROB 是要走的方向，
+再考慮 (b)，但 (b) 一定要搭配 §5c 底下那個協定修改才安全 ——
+把 bundle 的**類別遮罩**（每 lane 1 bit「是不是 load」、1 bit「是不是 store」）
+做成**獨立於 `valid` 的旁路訊號**由 rename 直接送出。那樣 `nfree` 只依賴
+「組成」而不依賴「有效」，規則 2 仍然成立，也不會有組合迴圈。
+這需要 `ifc.vh` 加兩個 `` `W ``-bit 埠，是監督者的決定。
+
+### `cfg_*` 下限回到 1
+
+v7.1 為了 all-or-nothing 把 `ld_max`/`st_max` 夾在 ``[`W, `LDQ_N]``。
+**v8 已移除這個夾制，範圍回到 ``[1, `LDQ_N]``**，實測 cfg = 1 / 2 / 3 都能前進：
+
+```
+cfg=1  cyc=23347 done=2912 thr=0.124    cfg=2  cyc=10297 done=2912 thr=0.282
+cfg=3  cyc=6598  done=2912 thr=0.441    cfg=8  cyc=3231  done=2912 thr=0.901
+cfg=16 cyc=3224  done=2912 thr=0.903
+```
+
+吞吐隨 mask 單調不降（CONTRACT v7 §10.3）✓
+
+### `cnt_lost_lsq` 不在本模組
+
+§8 v2 的 `cnt_lost_XX = Σ(想送 − 實際送)` 需要知道「想送幾條」，而本模組
+只看得到 `ds_valid`（= 已接受的那些）。**這個 counter 必須放在 `be_dispatch`**
+（它同時知道 `rn_valid` 與 `lsq_nfree`）。本模組維持 `cnt_st_mshr` 一個輸出。
 
 ---
 
@@ -253,6 +310,16 @@ side FIFO 深度 `MQN = 32`。**在 `fb_take` 與 `ds_valid` 之間同時在飛�
 
 目前的邊界：`fe_front` 的 `DQ_N = 16` + rename/dispatch 各 `` `W `` 條 ≈ 24 < 32，
 有 8 條的餘裕。**但如果 Agent D 加深 decode queue，這個不變量會靜默失效。**
+
+**v8 partial accept 之後會變緊還是變鬆？結論：最壞情況不變，但更常被逼近。**
+partial accept 不會增加 fetch 與 dispatch 之間的**容量** —— 沒收下的 uop 是停在
+`fe_front` 的 decode queue 裡，而那個佇列本來就已經算在 `DQ_N = 16` 裡了，
+`fe_front` 佇列滿了就不再 fetch。所以結構上界仍是 `DQ_N + 2*`W` ≈ 24。
+但 partial 讓佇列**更常處於接近滿的狀態**，所以實際峰值會往上界靠。
+
+自測直接量了這個峰值（`memflight`）：**21~23，全部 < 32** ✓，
+而且我把 `max_inflight_mem < 32` 做成了測試裡的硬斷言，
+Agent D 一旦加深 decode queue，這條會先炸出來而不是靜默錯資料。
 
 這正是 CONTRACT v7 §10 講的那類「容量不足、lint 抓不到」的錯誤，所以我為它寫了
 **專門的偵測與負測**（見 §8 的 T2 / T6）：
@@ -266,43 +333,6 @@ side FIFO 深度 `MQN = 32`。**在 `fb_take` 與 `ds_valid` 之間同時在飛�
 那需要改 `ifc.vh` + Agent D，是監督者的決定。
 
 ---
-
-## 8. 自測（`test/`）
-
-```bash
-model/ooo/lsu/test/run_tests.sh [scratch_dir]     # 預設 /tmp/agentf_lsu_test
-```
-
-對 §5b 表格裡的 5 組尺寸，各跑 **lint + yosys + 功能測試**。
-`test/gen_layout.py` 從 `common/ifc.vh` 抽欄位佈局產生 `layout.h`，
-所以 bit 佈局的唯一真相留在 `ifc.vh`，測試不自己複製一份。
-
-| 測項 | 內容 |
-|---|---|
-| T1 | 每個記憶體 uop 恰好收到一次 `done`、不卡死（含 AMO 只回報一次） |
-| T2 | **mem-event 對齊**：實測延遲不得低於該 uop 的 base latency |
-| T3 | **MSHR 是 MLP 上限**：全 DRAM 時 miss 吞吐 <= `min(MSHR_N, LDQ_N) / latency` |
-| T4 | `cnt_st_mshr` 語意：全 L1 hit 時為 0；全 DRAM 且 `LDQ_N > MSHR_N` 時 > 0 |
-| T5 | `cfg_ldq/stq` 在 **最小 / 中間 / MAX** 三點都要前進，且吞吐不隨 mask 變大而劣化 |
-| T6 | **負測**：刻意讓 side FIFO 溢位，斷言 T2 必須報錯（證明 T2 有牙齒）|
-
-實測（v7-base）：
-
-```
-cfg=1    cycles=8583  done=2912  thr=0.339/cyc  st_mshr=0     latviol=0
-cfg=8    cycles=3339  done=2912  thr=0.872/cyc  st_mshr=0     latviol=0
-cfg=16   cycles=3224  done=2912  thr=0.903/cyc  st_mshr=0     latviol=0
-all-DRAM cycles=6692  miss=565   miss_thr=0.0844/cyc  ceiling=0.0889  st_mshr=5581
-negative(deep fetch pipe) latviol=235   <- T6 期望 > 0
-```
-
-兩個值得記錄的觀察：
-
-1. **T3 是本模組存在意義的直接量測**。全 DRAM 時 miss 吞吐 0.0844/cyc，
-   緊貼 8 MSHR / 90 拍 = 0.0889 的理論上限 —— MSHR 確實在當 MLP 的閘門。
-2. **`LDQ_N = 8` 時 `cnt_st_mshr` 變成 0**，因為 LDQ 先滿，MSHR 永遠吃不滿。
-   也就是說 **MLP 的瓶頸是 `min(MSHR_N, LDQ_N)`**，掃 MSHR 數量時若不同時放大
-   LDQ，會量到一條假的平坦曲線。做 MSHR sweep 的人要注意這點。
 
 ## 6. `cfg_mshr_entries` 未接線
 
@@ -382,3 +412,43 @@ yosys -p 'read_verilog -I. lsu/lsu_q.v; synth -top lsu_q -flatten;
 若把 MSHR 放回整個 OOO 模型的分母看：4,460 / 26K ≈ 17%，確實高於 PLAN 估的
 1.8%；但 PLAN 那個估計假設的是「8 entry × 16 bit、1 埠」的裸倒數器陣列，
 沒有計入回填路徑與 `done` 仲裁。
+
+---
+
+## 8. 自測（`test/`）
+
+```bash
+model/ooo/lsu/test/run_tests.sh [scratch_dir]     # 預設 /tmp/agentf_lsu_test
+```
+
+對 §5b 表格裡的 5 組尺寸，各跑 **lint + yosys + 功能測試**。
+`test/gen_layout.py` 從 `common/ifc.vh` 抽欄位佈局產生 `layout.h`，
+所以 bit 佈局的唯一真相留在 `ifc.vh`，測試不自己複製一份。
+
+| 測項 | 內容 |
+|---|---|
+| T1 | 每個記憶體 uop 恰好收到一次 `done`、不卡死（含 AMO 只回報一次） |
+| T2 | **mem-event 對齊**：實測延遲不得低於該 uop 的 base latency |
+| T3 | **MSHR 是 MLP 上限**：全 DRAM 時 miss 吞吐 <= `min(MSHR_N, LDQ_N) / latency` |
+| T4 | `cnt_st_mshr` 語意：全 L1 hit 時為 0；全 DRAM 且 `LDQ_N > MSHR_N` 時 > 0 |
+| T5 | `cfg_ldq/stq` 在 **最小 / 中間 / MAX** 三點都要前進，且吞吐不隨 mask 變大而劣化 |
+| T6 | **負測**：刻意讓 side FIFO 溢位，斷言 T2 必須報錯（證明 T2 有牙齒）|
+
+實測（v7-base）：
+
+```
+cfg=1    cycles=8583  done=2912  thr=0.339/cyc  st_mshr=0     latviol=0
+cfg=8    cycles=3339  done=2912  thr=0.872/cyc  st_mshr=0     latviol=0
+cfg=16   cycles=3224  done=2912  thr=0.903/cyc  st_mshr=0     latviol=0
+all-DRAM cycles=6692  miss=565   miss_thr=0.0844/cyc  ceiling=0.0889  st_mshr=5581
+negative(deep fetch pipe) latviol=235   <- T6 期望 > 0
+```
+
+兩個值得記錄的觀察：
+
+1. **T3 是本模組存在意義的直接量測**。全 DRAM 時 miss 吞吐 0.0844/cyc，
+   緊貼 8 MSHR / 90 拍 = 0.0889 的理論上限 —— MSHR 確實在當 MLP 的閘門。
+2. **`LDQ_N = 8` 時 `cnt_st_mshr` 變成 0**，因為 LDQ 先滿，MSHR 永遠吃不滿。
+   也就是說 **MLP 的瓶頸是 `min(MSHR_N, LDQ_N)`**，掃 MSHR 數量時若不同時放大
+   LDQ，會量到一條假的平坦曲線。做 MSHR sweep 的人要注意這點。
+

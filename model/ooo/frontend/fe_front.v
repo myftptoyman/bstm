@@ -21,9 +21,11 @@ module fe_front (
     input  wire                  mispred_in,
     output wire [`W-1:0]         de_valid,
     output wire [`W*`DUOP_W-1:0] de_duop,
-    input  wire                  de_ready,
+    input  wire [2:0]            de_nready,    // v8: 下游這拍能收前 N 條（0..`W）
     output wire [47:0]           cnt_st_fetch,
     output wire [47:0]           cnt_st_refill,
+    output wire [47:0]           cnt_lost_fetch,
+    output wire [47:0]           cnt_lost_refill,
     output wire [47:0]           cnt_mispred
 );
 
@@ -41,6 +43,7 @@ localparam [DQ_CW-1:0] W_C  = `W;
 // CNT_B「碰巧」是 6，但它是 48-bit counter 的 8-bit 分段數，
 // 與 `PRF_W / `ROB_W 無關，做 PRF/ROB sweep 時不可跟著改。
 localparam CNT_B = 6;
+localparam CW    = CNT_B * 8;    // = 48，counter 埠寬
 
 // ---------------- FE_* 事件位元（include/bstf.h）----------------
 // [1:0] bubbles  [2] ubtb_hit  [3] btb_override  [4] dir_ok
@@ -59,7 +62,7 @@ reg                  shadow_q;    // 1 = 目前走 wrong path
 reg                  refill_q;    // 1 = flush 之後還沒成功送出過 uop（重填視窗）
 
 // ================= 輸出側（送往 rename）=================
-// 一次最多呈現 4 條；de_ready = 1 代表「本拍把 de_valid 全收下」（all-or-nothing）
+// 一次最多呈現 `W 條；下游用 de_nready 告訴我們這拍收得下前幾條（v8 partial accept）
 wire [TCW-1:0] n_pres = (dq_cnt_q >= W_C) ? W_T : dq_cnt_q[TCW-1:0];
 
 // thermometer：slot i 有效 <=> i < n_pres（寬度跟著 `W 走，不寫死 4'b....）
@@ -72,7 +75,9 @@ end
 endgenerate
 assign de_duop  = dq_q[`W*DQ_W-1:0];
 
-wire [TCW-1:0] n_out = de_ready ? n_pres : {TCW{1'b0}};         // 本拍出隊數
+// v8 partial accept：下游收前 de_nready 條，剩下的留在 queue 裡依序重送（規則 3）。
+// 壓縮式移位佇列天生支援任意 n_out，不用額外的保留邏輯。
+wire [TCW-1:0] n_out = (n_pres < de_nready) ? n_pres : de_nready;         // 本拍出隊數
 wire [DQ_CW-1:0] rem = dq_cnt_q - {{(DQ_CW-TCW){1'b0}}, n_out};   // 出隊後剩餘
 
 // ================= 輸入側（從 fetch buffer 取）=================
@@ -168,93 +173,76 @@ always @(posedge clk) begin
         blk_seen_q <= blk_end_taken ? 1'b0 :
                       ((~blk_seen_q & fb_valid[0]) ? 1'b1 : blk_seen_q);
         shadow_q   <= mis_now ? 1'b1 : shadow_q;
-        // 成功送出 uop（all-or-nothing 傳遞）就離開重填視窗
-        refill_q   <= (de_ready & (de_valid != {`W{1'b0}})) ? 1'b0 : refill_q;
+        // 只要這拍真的送出至少一條 uop 就離開重填視窗
+        refill_q   <= (n_out != {TCW{1'b0}}) ? 1'b0 : refill_q;
     end
 end
 
 // ================= counter（6 段 8-bit 進位鏈，無寬算術）=================
+// ---------------- counter（CONTRACT v8 §8 v2）----------------
 // 歸因原則：一個 stall cycle 只能有一個擁有者，而且必須是真正的來源。
-// 「下游收得下、但前端一條 uop 都交不出來」這個集合被切成互斥的兩半：
-//   cnt_st_fetch  = 真正的前端斷流（I-cache 泡泡、fetch buffer 空）
-//   cnt_st_refill = flush 之後到第一次成功送出 uop 之間的重填拍，
-//                   真正的來源是誤預測而不是 fetch 頻寬
-// 兩者相加 == 舊版的 cnt_st_fetch，一拍都沒有多算也沒有漏掉。
-// flush 當拍本身兩邊都不計（那是誤預測懲罰，事件記在 cnt_mispred）。
-wire starve    = de_ready & (de_valid == {`W{1'b0}}) & ~flush;
-wire c_stf_inc = starve & ~refill_q;
-wire c_rfl_inc = starve &  refill_q;
-reg  [47:0] c_stf_q;
-wire [CNT_B-2:0] c_stf_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [CNT_B-1:0] c_stf_car;
-genvar gs;
+// partial accept 之後每個來源都有兩個互補的量：
+//   cnt_st_*   完全停擺的拍數（下游收得下、但前端一條都交不出來）
+//   cnt_lost_* 損失的 uop-slot（下游開出的名額 − 前端真的填上的），一拍 0..`W
+// 「下游收得下」現在是 de_nready != 0（不是舊的 de_ready）。
+// flush 當拍兩邊都不計（那是誤預測懲罰本身，事件記在 cnt_mispred）。
+// refill_q 把「flush 後的重填」從「真前端斷流」裡分出來，兩者互斥、相加守恆。
+wire starve_all = (de_nready != 3'd0) & (n_pres == {TCW{1'b0}}) & ~flush;
+wire [TCW-1:0] lost_slot = flush ? {TCW{1'b0}} : (de_nready - n_out);
+
+wire [TCW-1:0] inc_st_fe = (starve_all & ~refill_q) ? 3'd1 : 3'd0;
+wire [TCW-1:0] inc_st_rf = (starve_all &  refill_q) ? 3'd1 : 3'd0;
+wire [TCW-1:0] inc_ls_fe = refill_q ? {TCW{1'b0}} : lost_slot;
+wire [TCW-1:0] inc_ls_rf = refill_q ? lost_slot   : {TCW{1'b0}};
+
+// cnt_mispred 仍是「事件數」（切 shadow 的次數），不是拍數
+wire [TCW-1:0] inc_mis   = mis_now ? 3'd1 : 3'd0;
+
+localparam NC = 5;   // 0=st_fetch 1=st_refill 2=lost_fetch 3=lost_refill 4=mispred
+wire [NC*TCW-1:0] cnt_inc = {inc_mis, inc_ls_rf, inc_ls_fe, inc_st_rf, inc_st_fe};
+
+reg  [NC*CW-1:0]        cnt_q;
+wire [NC*9-1:0]         cnt_s0;
+wire [NC*(CNT_B-1)-1:0] cnt_car;
+genvar gc, gb;
 generate
-for (gs = 0; gs < CNT_B-1; gs = gs + 1) begin : g_stf
-    assign c_stf_ff[gs] = (c_stf_q[8*gs +: 8] == 8'hFF);
+for (gc = 0; gc < NC; gc = gc + 1) begin : g_cnt
+    // byte0 一次加 0..`W（8-bit 加法 + 進位輸出，規則 1：沒有寬算術）
+    assign cnt_s0[gc*9 +: 9] = {1'b0, cnt_q[gc*CW +: 8]}
+                             + {{(9-TCW){1'b0}}, cnt_inc[gc*TCW +: TCW]};
+    // byte 1..CNT_B-2 是否為 8'hFF；不自我參照，避免 UNOPTFLAT 組合迴圈
+    wire [CNT_B-3:0] ff;
+    for (gb = 1; gb < CNT_B-1; gb = gb + 1) begin : g_ff
+        assign ff[gb-1] = (cnt_q[gc*CW + 8*gb +: 8] == 8'hFF);
+    end
+    wire k0 = cnt_s0[gc*9 + 8];
+    // 以下 5 行對應 CNT_B=6；改 CNT_B 要一起改
+    assign cnt_car[gc*(CNT_B-1) + 0] = k0;
+    assign cnt_car[gc*(CNT_B-1) + 1] = k0 & ff[0];
+    assign cnt_car[gc*(CNT_B-1) + 2] = k0 & (&ff[1:0]);
+    assign cnt_car[gc*(CNT_B-1) + 3] = k0 & (&ff[2:0]);
+    assign cnt_car[gc*(CNT_B-1) + 4] = k0 & (&ff[3:0]);
 end
 endgenerate
-// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
-assign c_stf_car[0] = c_stf_inc;
-assign c_stf_car[1] = c_stf_inc & c_stf_ff[0];
-assign c_stf_car[2] = c_stf_inc & (&c_stf_ff[1:0]);
-assign c_stf_car[3] = c_stf_inc & (&c_stf_ff[2:0]);
-assign c_stf_car[4] = c_stf_inc & (&c_stf_ff[3:0]);
-assign c_stf_car[5] = c_stf_inc & (&c_stf_ff[4:0]);
 
-// cnt_mispred：前端偵測到的方向誤預測（切 shadow 的次數）
-wire c_mis_inc = mis_now;
-reg  [47:0] c_mis_q;
-wire [CNT_B-2:0] c_mis_ff;   // byte 0..4 是否為 8'hFF（最高 byte 不需要）
-wire [CNT_B-1:0] c_mis_car;
-genvar gm;
-generate
-for (gm = 0; gm < CNT_B-1; gm = gm + 1) begin : g_mis
-    assign c_mis_ff[gm] = (c_mis_q[8*gm +: 8] == 8'hFF);
-end
-endgenerate
-assign c_mis_car[0] = c_mis_inc;
-assign c_mis_car[1] = c_mis_inc & c_mis_ff[0];
-assign c_mis_car[2] = c_mis_inc & (&c_mis_ff[1:0]);
-assign c_mis_car[3] = c_mis_inc & (&c_mis_ff[2:0]);
-assign c_mis_car[4] = c_mis_inc & (&c_mis_ff[3:0]);
-assign c_mis_car[5] = c_mis_inc & (&c_mis_ff[4:0]);
-
-// cnt_st_refill：flush 後的重填拍
-reg  [47:0] c_rfl_q;
-wire [CNT_B-2:0] c_rfl_ff;
-wire [CNT_B-1:0] c_rfl_car;
-genvar gf;
-generate
-for (gf = 0; gf < CNT_B-1; gf = gf + 1) begin : g_rfl
-    assign c_rfl_ff[gf] = (c_rfl_q[8*gf +: 8] == 8'hFF);
-end
-endgenerate
-// 以下的進位鏈對應 CNT_B=6（48-bit counter）；改 CNT_B 要一起改
-assign c_rfl_car[0] = c_rfl_inc;
-assign c_rfl_car[1] = c_rfl_inc & c_rfl_ff[0];
-assign c_rfl_car[2] = c_rfl_inc & (&c_rfl_ff[1:0]);
-assign c_rfl_car[3] = c_rfl_inc & (&c_rfl_ff[2:0]);
-assign c_rfl_car[4] = c_rfl_inc & (&c_rfl_ff[3:0]);
-assign c_rfl_car[5] = c_rfl_inc & (&c_rfl_ff[4:0]);
-
-integer ic;
+integer ic, jc;
 always @(posedge clk) begin
-    if (rst) begin
-        c_stf_q <= 48'd0;
-        c_mis_q <= 48'd0;
-        c_rfl_q <= 48'd0;
-    end else begin
-        for (ic = 0; ic < CNT_B; ic = ic + 1) begin
-            if (c_stf_car[ic]) c_stf_q[8*ic +: 8] <= c_stf_q[8*ic +: 8] + 8'd1;
-            if (c_mis_car[ic]) c_mis_q[8*ic +: 8] <= c_mis_q[8*ic +: 8] + 8'd1;
-            if (c_rfl_car[ic]) c_rfl_q[8*ic +: 8] <= c_rfl_q[8*ic +: 8] + 8'd1;
+    if (rst) cnt_q <= {NC*CW{1'b0}};
+    else begin
+        for (jc = 0; jc < NC; jc = jc + 1) begin
+            cnt_q[jc*CW +: 8] <= cnt_s0[jc*9 +: 8];
+            for (ic = 1; ic < CNT_B; ic = ic + 1)
+                if (cnt_car[jc*(CNT_B-1) + (ic-1)])
+                    cnt_q[jc*CW + 8*ic +: 8] <= cnt_q[jc*CW + 8*ic +: 8] + 8'd1;
         end
     end
 end
 
-assign cnt_st_fetch  = c_stf_q;
-assign cnt_st_refill = c_rfl_q;
-assign cnt_mispred   = c_mis_q;
+assign cnt_st_fetch    = cnt_q[0*CW +: CW];
+assign cnt_st_refill   = cnt_q[1*CW +: CW];
+assign cnt_lost_fetch  = cnt_q[2*CW +: CW];
+assign cnt_lost_refill = cnt_q[3*CW +: CW];
+assign cnt_mispred     = cnt_q[4*CW +: CW];
 
 // ---------------- 編譯期斷言（CONTRACT v7 §10）----------------
 // 本模組的 lane 邏輯是對 `W = 4 手動展開的（n_avail / n_blk / 填入 mux）。

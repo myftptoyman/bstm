@@ -45,18 +45,51 @@ typedef struct {
 /* staging 裡每一筆記錄的「它從哪裡來」，供 redirect 反推 shadow 用 */
 typedef struct { uint64_t rec_byte, fe_idx, mem_idx; } bstm_pos_t;
 
+/* 每 lane 的 fetch 狀態機（CONTRACT §5 G2）
+ *   CORRECT -> SHADOW   : fb_redirect & fb_redir_shadow
+ *   SHADOW  -> STARVED  : shadow 的 shadow_len 筆供應完、flush 還沒到
+ *   SHADOW/STARVED -> CORRECT : fb_redirect & ~fb_redir_shadow（後端 flush 到達）
+ * STARVED 的行為 = 停止供應 uop（fb_valid 全 0），等同前端斷流。
+ * **不可**在 shadow 用完時自己溜回正確路徑 —— 那會讓模型以為還在推測，
+ * 卻收到正確路徑的 uop 並且把它們 retire 掉。 */
+enum { BSTM_FS_CORRECT = 0, BSTM_FS_SHADOW = 1, BSTM_FS_STARVED = 2 };
+
 typedef struct {
     const bstf_trace_t *trace;
     bstf_cursor_t cur;            /* 下一筆「要進 staging」的位置 */
-    bstf_cursor_t last_br;        /* 最近一筆已消耗、且有 shadow 的記錄 */
+    bstf_cursor_t last_br;        /* 這次進 shadow 的那筆分支 */
     uint8_t  has_last_br;
     uint8_t  active;
     uint8_t  eof;
+    uint8_t  fstate;              /* BSTM_FS_* */
     uint16_t head, cnt;           /* staging 的有效區間 [head, head+cnt) */
     uint64_t   stage[BSTM_REFILL_M];  /* bit47..0 = entry, bit48 = 有 shadow */
     bstm_pos_t pos  [BSTM_REFILL_M];
-    uint64_t consumed;            /* 已消耗的記錄數（含 wrong-path） */
-    uint64_t wrongpath;           /* 其中 wrong-path 的筆數 */
+
+    /* ---- wrong-path 的帳與不變式 ---- */
+    uint64_t branch_byte;         /* 這次進 shadow 的分支位元組位置 */
+    uint64_t hi_branch_byte;      /* 歷史最大值；新的分支必須嚴格大於它 */
+    uint64_t hi_resume_byte;      /* 歷史最大還原點；也必須嚴格遞增 */
+    uint64_t n_enter, n_leave;    /* 進/出 shadow 次數，必須配對 */
+    uint64_t n_starve;            /* 進入 STARVED 的次數 */
+    uint64_t n_nobranch;          /* 要求跳 shadow 但找不到帶 shadow 的分支 */
+    uint64_t n_resolved;          /* 要求跳 shadow 但那個 block 剛剛才解析完（過期請求） */
+    uint64_t resolved_fe_idx;     /* 剛剛解析完的分支所屬 block */
+    uint8_t  resolved_valid;
+    uint64_t n_blk_skipped;       /* 因為 window 跨 block 而沒被模型看到的 fetch block */
+    uint64_t n_blk_seen;          /* 有被放到 window 第 0 筆的 correct-path block 數 */
+    uint64_t n_redir_blk_seen;    /* 其中帶 FE_REDIRECT 的（= 模型有機會看到的誤預測數） */
+    uint64_t fe_head_prev;        /* 上一拍 window 第 0 筆的 fe_idx */
+    uint8_t  fe_head_valid;
+    /* 這一拍消耗掉的記錄裡，最後一筆帶 shadow 的分支（同拍 take + redirect 用） */
+    bstm_pos_t br_consumed;
+    uint8_t    br_consumed_v;
+    bstm_pos_t last_deliv;        /* 這一拍最後交付的 correct-path 記錄 */
+    uint8_t    last_deliv_v;
+    uint64_t cp_consumed;         /* 消耗掉的 correct-path 記錄數 */
+    uint64_t wp_consumed;         /* 消耗掉的 wrong-path 記錄數 */
+    uint64_t consumed;            /* = cp_consumed + wp_consumed */
+    uint64_t wrongpath;           /* 同 wp_consumed，保留舊名 */
 } bstm_lane_t;
 
 typedef struct {
@@ -67,6 +100,12 @@ typedef struct {
     uint64_t n_gather;            /* scalar gather 呼叫次數     */
     uint64_t n_gathered;          /* gather 到的記錄總數        */
     uint64_t n_redirect;          /* 處理過的 redirect 次數     */
+    uint64_t n_enter_shadow;      /* 成功進 shadow 的次數        */
+    uint64_t n_leave_shadow;      /* 回正確路徑的次數            */
+    uint64_t n_redir_nobranch;    /* 要求跳 shadow 但 staging 裡沒有帶 shadow 的記錄 */
+    uint64_t n_redir_resolved;    /* 要求跳 shadow 但該 block 剛解析完（過期請求，忽略） */
+    uint64_t n_redir_in_shadow;   /* 已經在 shadow 裡又收到跳 shadow 的要求（忽略） */
+    uint64_t n_starve_cycles;     /* lane-cycle 數：STARVED 且 staging 空 */
 } bstm_refill_t;
 
 void bstm_refill_init(bstm_refill_t *r,
@@ -88,8 +127,22 @@ void bstm_refill_window(bstm_refill_t *r, bstm_fbwin_t *win);
 void bstm_refill_consume(bstm_refill_t *r, const vec_t take[3],
                          vec_t redirect, vec_t redir_shadow);
 
-/* 哪些 lane 的 trace 已經跑完（bit l = lane l） */
+/* 哪些 lane 的 trace 已經跑完（bit l = lane l）。
+ * STARVED 不算跑完 —— 它在等 flush。 */
 uint64_t bstm_refill_done_mask(const bstm_refill_t *r);
+
+/* 哪些 lane 這拍供不出 uop（STARVED 且 staging 空）。純診斷用。 */
+uint64_t bstm_refill_starved_mask(const bstm_refill_t *r);
+
+/* ---- 不變式檢查（測試與 CI 用，主迴圈不必呼叫） ----
+ * 回傳 0 = 全部成立。訊息寫進 msg。
+ *  1. 每次進 shadow 的分支位置嚴格遞增（correct-path 不倒退）
+ *  2. 進 shadow 次數 == 離開次數 + (目前還在 shadow ? 1 : 0)
+ *  3. cp_consumed + wp_consumed == consumed
+ *  4. lane 跑完時 cp_consumed == hdr.n_records（每筆恰好消耗一次）
+ */
+int bstm_refill_check(const bstm_refill_t *r, int lane, int at_eof,
+                      char *msg, size_t msglen);
 
 /* entry 打包/解包（給測試用） */
 #define BSTM_ENT_DUOP(e)  ((uint32_t)((e) & 0xFFFFFFFFu))

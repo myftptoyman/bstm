@@ -87,13 +87,11 @@ struct Dut {
         mock_state_t *t = cur; cur = nxt; nxt = t;
 
         /* counter 是同步暫存器，clk 上升後才比 */
-        static const char *cn[MOCK_NCNT] = {
-            "cnt_cycles","cnt_retired","cnt_wrongpath","cnt_st_fetch","cnt_st_rename",
-            "cnt_st_iq","cnt_st_rob","cnt_st_lsq","cnt_st_mshr","cnt_mispred","cnt_rob_occ_sum" };
         uint64_t vref[MOCK_NCNT] = {
             v->cnt_cycles, v->cnt_retired, v->cnt_wrongpath, v->cnt_st_fetch,
-            v->cnt_st_rename, v->cnt_st_iq, v->cnt_st_rob, v->cnt_st_lsq,
-            v->cnt_st_mshr, v->cnt_mispred, v->cnt_rob_occ_sum };
+            v->cnt_st_refill, v->cnt_st_rename, v->cnt_st_iq, v->cnt_st_rob,
+            v->cnt_st_lsq, v->cnt_st_mshr, v->cnt_mispred, v->cnt_rob_occ_sum };
+        const char *const *cn = mock_counter_names;
         for (int i = 0; i < MOCK_NCNT; i++)
             ok &= ctx.cmp(cn[i], vref[i], bs_get(cur->cnt[i], BSTM_CNT_W, 0), BSTM_CNT_W);
 
@@ -233,6 +231,12 @@ int main(int argc, char **argv)
         for (int i = 0; i < 7 && !stop; i++) { inject(&win, s, lf.next()); stop = !d.step(&win, s, 0, &out); }
     }
 
+    std::printf("最終 counter（lane 0）: retired=%llu wrongpath=%llu "
+                "st_refill=%llu mispred=%llu\n",
+                (unsigned long long)bs_get(d.cur->cnt[1], BSTM_CNT_W, 0),
+                (unsigned long long)bs_get(d.cur->cnt[2], BSTM_CNT_W, 0),
+                (unsigned long long)bs_get(d.cur->cnt[4], BSTM_CNT_W, 0),
+                (unsigned long long)bs_get(d.cur->cnt[10], BSTM_CNT_W, 0));
     std::printf("活動量: sum(fb_take)=%ld, fb_take 取過的值 = %s%s%s%s%s, "
                 "redirect %ld 次 (其中跳 shadow %ld)\n",
                 d.n_take,

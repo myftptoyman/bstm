@@ -77,13 +77,13 @@ module be_eu (
         assign uop[g]    = iss_ruop[g*`RUOP_W +: `RUOP_W];
         assign irb[g]    = iss_robidx[g*`ROB_W +: `ROB_W];
         assign drb[g]    = lsu_done_rob[g*`ROB_W +: `ROB_W];
-        assign i_mem[g]  = (uop[g][`RUOP_CLASS] == `UC_LOAD)
-                         | (uop[g][`RUOP_CLASS] == `UC_STORE)
-                         | (uop[g][`RUOP_CLASS] == `UC_AMO);
+        assign i_mem[g]  = (uop[g][`RUOP_CLASS +: `UC_W] == `UC_LOAD)
+                         | (uop[g][`RUOP_CLASS +: `UC_W] == `UC_STORE)
+                         | (uop[g][`RUOP_CLASS +: `UC_W] == `UC_AMO);
         assign i_dv[g]   = uop[g][`RUOP_DV];
         // lat<=1 且非 mem：本拍就能參加 writeback 競爭（bypass）
-        assign i_now[g]  = iss_valid[g] & ~i_mem[g] & (uop[g][`RUOP_LAT] <= LAT1);
-        assign i_pool[g] = iss_valid[g] & (i_mem[g] | (uop[g][`RUOP_LAT] > LAT1));
+        assign i_now[g]  = iss_valid[g] & ~i_mem[g] & (uop[g][`RUOP_LAT +: `LAT_W] <= LAT1);
+        assign i_pool[g] = iss_valid[g] & (i_mem[g] | (uop[g][`RUOP_LAT +: `LAT_W] > LAT1));
     end endgenerate
 
     // ---------------------------------------------- 組合暫存
@@ -176,7 +176,7 @@ module be_eu (
             for (k = 0; k < `W; k = k + 1)
                 if (i_now[k] && (irb[k] == pidx)) begin
                     dvx  = i_dv[k];
-                    prfx = uop[k][`RUOP_D];
+                    prfx = uop[k][`RUOP_D +: `PRF_W];
                 end
             if (pick_v[r]) begin
                 n_wb_prf[r*`PRF_W +: `PRF_W] = prfx;
@@ -189,8 +189,8 @@ module be_eu (
         clr_m  = {`PRF_N{1'b0}};
         mem_oh = {`ROB_N{1'b0}};
         for (k = 0; k < `W; k = k + 1) begin
-            if (iss_valid[k] & i_dv[k] & (i_mem[k] | (uop[k][`RUOP_LAT] >= LAT2)))
-                clr_m = clr_m | ohp(uop[k][`RUOP_D]);
+            if (iss_valid[k] & i_dv[k] & (i_mem[k] | (uop[k][`RUOP_LAT +: `LAT_W] >= LAT2)))
+                clr_m = clr_m | ohp(uop[k][`RUOP_D +: `PRF_W]);
             if (iss_valid[k] & i_mem[k]) mem_oh = mem_oh | ohr(irb[k]);
         end
     end
@@ -267,9 +267,9 @@ module be_eu (
                             eu_v[i]   <= 1'b1;
                             eu_wt[i]  <= i_mem[k];
                             eu_dv[i]  <= i_dv[k];
-                            eu_prf[i*`PRF_W +: `PRF_W] <= uop[k][`RUOP_D];
+                            eu_prf[i*`PRF_W +: `PRF_W] <= uop[k][`RUOP_D +: `PRF_W];
                             eu_cnt[i*`LAT_W +: `LAT_W] <=
-                                (uop[k][`RUOP_LAT] >= LAT2) ? (uop[k][`RUOP_LAT] - LAT2)
+                                (uop[k][`RUOP_LAT +: `LAT_W] >= LAT2) ? (uop[k][`RUOP_LAT +: `LAT_W] - LAT2)
                                                             : {`LAT_W{1'b0}};
                         end else begin
                             eu_v[i] <= 1'b0;

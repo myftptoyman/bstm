@@ -50,10 +50,10 @@ static void bs_cnt_add(vec_t *c, const vec_t *inc, int n, vec_t en)
 
 const char *const mock_counter_names[MOCK_NCNT] = {
     "cnt_cycles", "cnt_retired", "cnt_wrongpath", "cnt_st_fetch",
-    "cnt_st_rename", "cnt_st_iq", "cnt_st_rob", "cnt_st_lsq",
+    "cnt_st_refill", "cnt_st_rename", "cnt_st_iq", "cnt_st_rob", "cnt_st_lsq",
     "cnt_st_mshr", "cnt_mispred", "cnt_rob_occ_sum"
 };
-enum { C_CYCLES, C_RETIRED, C_WRONGPATH, C_ST_FETCH, C_ST_RENAME,
+enum { C_CYCLES, C_RETIRED, C_WRONGPATH, C_ST_FETCH, C_ST_REFILL, C_ST_RENAME,
        C_ST_IQ, C_ST_ROB, C_ST_LSQ, C_ST_MSHR, C_MISPRED, C_ROB_OCC };
 
 /* ---------- eval：逐行對應 mock_ooo_top.v ---------- */
@@ -65,13 +65,15 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
     const vec_t *cfg_fw  = p->cfg[BSTM_CFG_FETCH_W];
     const vec_t *cfg_cw  = p->cfg[BSTM_CFG_COMMIT_W];
     vec_t en = p->enable;                /* rst 時所有暫存器歸零（下面 & ~rst） */
-    vec_t nvalid[3], t3[3], want[3], take[3], ret[3], occ_t[7], occ_n[7];
+    vec_t nvalid[3], t3[3], want[3], take[3], take_cp[3], ret[3];
+    vec_t occ_t[7], occ_n[7], occcp_t[7], occcp_n[7];
     vec_t sum8[8], occ8[8], want8[8], robx[8];
     vec_t cwx[7], iqx[7], retx[7], nret[7], inc1[1], incv[1];
-    vec_t fw_lt, rob_full, cw_gt, any_v, mispred, sh_end;
-    vec_t st_fetch, st_rename, st_iq, st_rob, st_lsq, st_mshr;
+    vec_t n_wp[3];
+    vec_t fw_lt, rob_full, cw_gt, any_v, mispred, sh_end, refilling, fe_dry;
+    vec_t st_fetch, st_refill, st_rename, st_iq, st_rob, st_lsq, st_mshr;
     vec_t shc_n[6], shc_dec[6], one6[6], twelve[6], nz;
-    int i, b;
+    int i, b, k;
 
     /* nvalid = v0+v1+v2+v3（3 bit） */
     nvalid[0] = nvalid[1] = nvalid[2] = VZERO;
@@ -99,8 +101,32 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
 
     for (i = 0; i < 3; i++) cwx[i] = cfg_cw[i];
     for (i = 3; i < 7; i++) cwx[i] = VZERO;
-    cw_gt = bs_ult(p->occ, cwx, 7);                   /* occ < cfg_commit_width */
-    for (i = 0; i < 3; i++) ret[i] = MUX(cfg_cw[i], p->occ[i], cw_gt);
+    /* retire 只看 correct-path 的佔用 -> wrong-path uop 永遠不 retire */
+    cw_gt = bs_ult(p->occ_cp, cwx, 7);                /* occ_cp < cfg_commit_width */
+    for (i = 0; i < 3; i++) ret[i] = MUX(cfg_cw[i], p->occ_cp[i], cw_gt);
+
+    /* 逐 slot 數 DUOP_WRONGPATH（fb_duop[e*32+31]），只算被 take 掉的那幾個。
+     * window 可能正好跨在 correct/wrong 邊界上，所以不能只看第 0 筆。 */
+    {
+        vec_t nwp[3], one[3], gt, term[3];
+        nwp[0] = nwp[1] = nwp[2] = VZERO;
+        for (k = 0; k < BSTM_W; k++) {
+            vec_t kc[3];
+            kc[0] = (k & 1) ? VONES : VZERO;
+            kc[1] = (k & 2) ? VONES : VZERO;
+            kc[2] = (k & 4) ? VONES : VZERO;
+            gt = bs_ult(kc, take, 3);                 /* take > k */
+            term[0] = gt & win->duop[k * BSTM_DUOP_W + 31];
+            term[1] = term[2] = VZERO;
+            bs_add(one, nwp, term, 3, VZERO);
+            nwp[0] = one[0]; nwp[1] = one[1]; nwp[2] = one[2];
+        }
+        for (i = 0; i < 3; i++) n_wp[i] = nwp[i];
+        /* take_cp = take - n_wp（3 bit） */
+        { vec_t nn[3];
+          for (i = 0; i < 3; i++) nn[i] = ~n_wp[i];
+          bs_add(take_cp, take, nn, 3, VONES); }
+    }
 
     any_v   = bs_orn(win->valid, BSTM_W);
     mispred = any_v & win->fe[7] & ~win->fe[4] & ~p->in_shadow;
@@ -110,8 +136,11 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
     out->redirect     = mispred | sh_end;
     out->redir_shadow = mispred;
 
-    /* stall 分類 */
-    st_fetch  = ~bs_orn(nvalid, 3);
+    /* stall 分類。CONTRACT §8 規則 2：st_fetch + st_refill == 原本的 st_fetch */
+    refilling = p->in_shadow | bs_orn(p->shadow_cnt, 6);
+    fe_dry    = ~bs_orn(nvalid, 3);
+    st_fetch  = fe_dry & ~refilling;
+    st_refill = fe_dry &  refilling;
     st_rename = rob_full & bs_orn(want, 3);
     for (i = 0; i < 6; i++) iqx[i] = cfg_iq[i];
     iqx[6] = VZERO;
@@ -120,17 +149,22 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
     st_lsq    = bs_orn(win->mem, 8);
     st_mshr   = win->fe[3];
 
-    /* occ' = occ + take - ret（7 bit wrap） */
+    /* occ'    = occ    + take    - ret （7 bit wrap）
+     * occ_cp' = occ_cp + take_cp - ret
+     * flush（sh_end）到達時 occ 改成 occ_cp' —— wrong-path 整批丟掉 */
     for (i = 0; i < 3; i++) retx[i] = ret[i];
     for (i = 3; i < 7; i++) retx[i] = VZERO;
-    {
-        vec_t takex[7];
-        for (i = 0; i < 3; i++) takex[i] = take[i];
-        for (i = 3; i < 7; i++) takex[i] = VZERO;
-        bs_add(occ_t, p->occ, takex, 7, VZERO);
-    }
     for (i = 0; i < 7; i++) nret[i] = ~retx[i];
-    bs_add(occ_n, occ_t, nret, 7, VONES);             /* +(-ret) */
+    {
+        vec_t takex[7], takecpx[7];
+        for (i = 0; i < 3; i++) { takex[i] = take[i]; takecpx[i] = take_cp[i]; }
+        for (i = 3; i < 7; i++) { takex[i] = VZERO;   takecpx[i] = VZERO; }
+        bs_add(occ_t,   p->occ,    takex,   7, VZERO);
+        bs_add(occcp_t, p->occ_cp, takecpx, 7, VZERO);
+    }
+    bs_add(occ_n,   occ_t,   nret, 7, VONES);         /* +(-ret) */
+    bs_add(occcp_n, occcp_t, nret, 7, VONES);
+    for (i = 0; i < 7; i++) occ_n[i] = MUX(occ_n[i], occcp_n[i], sh_end);
 
     /* shadow */
     nz = bs_orn(p->shadow_cnt, 6);
@@ -149,6 +183,8 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
     /* ---- 暫存器更新（帶 enable / rst） ---- */
     for (i = 0; i < 7; i++)
         s->occ[i] = ((occ_n[i] & ~rst) & en) | (p->occ[i] & ~en);
+    for (i = 0; i < 7; i++)
+        s->occ_cp[i] = ((occcp_n[i] & ~rst) & en) | (p->occ_cp[i] & ~en);
     {
         vec_t nsh = (mispred | (~mispred & ~sh_end & p->in_shadow)) & ~rst;
         s->in_shadow = (nsh & en) | (p->in_shadow & ~en);
@@ -161,9 +197,11 @@ void mock_eval_rst(mock_state_t *s, const mock_state_t *p,
     inc1[0] = VONES;
     bs_cnt_add(s->cnt[C_CYCLES],    inc1, 1, en);
     bs_cnt_add(s->cnt[C_RETIRED],   ret,  3, en);
-    { vec_t wp[3]; for (i = 0; i < 3; i++) wp[i] = take[i] & p->in_shadow;
-      bs_cnt_add(s->cnt[C_WRONGPATH], wp, 3, en); }
+    /* 綁在 fb_duop 的 wrongpath 位元（不是模型自己的 in_shadow）：
+     * 直接驗證 runtime 標了旗標，而且數字精確等於供應的 wrong-path 記錄數 */
+    bs_cnt_add(s->cnt[C_WRONGPATH], n_wp, 3, en);
     incv[0] = st_fetch;  bs_cnt_add(s->cnt[C_ST_FETCH],  incv, 1, en);
+    incv[0] = st_refill; bs_cnt_add(s->cnt[C_ST_REFILL], incv, 1, en);
     incv[0] = st_rename; bs_cnt_add(s->cnt[C_ST_RENAME], incv, 1, en);
     incv[0] = st_iq;     bs_cnt_add(s->cnt[C_ST_IQ],     incv, 1, en);
     incv[0] = st_rob;    bs_cnt_add(s->cnt[C_ST_ROB],    incv, 1, en);

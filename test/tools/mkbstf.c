@@ -19,6 +19,7 @@ int main(int argc, char **argv)
 {
     const char *out = "synth";
     long N = 20000; int D = 32; unsigned simpoint = 0; uint32_t seed = 1;
+    int mispct = 5;              /* 會誤預測（= 帶 shadow）的 block 百分比 */
     int i;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i+1 < argc) out = argv[++i];
@@ -26,7 +27,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-d") && i+1 < argc) D = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--simpoint") && i+1 < argc) simpoint = (unsigned)atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s -o base -n N -d D -s seed --simpoint id\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "-m") && i+1 < argc) mispct = atoi(argv[++i]);
+        else { fprintf(stderr,
+                 "usage: %s -o base -n N -d D -s seed -m mispred%% --simpoint id\n", argv[0]);
+               return 2; }
     }
     rs = 0x9E3779B97F4A7C15ULL ^ seed;
 
@@ -55,8 +59,11 @@ int main(int argc, char **argv)
         if (R->uop_class == UC_BRANCH || R->uop_class == UC_JALR || in_blk >= 6) {
             R->is_block_end = 1; R->flags |= BF_BLK_END; in_blk = 0;
         }
-        if (R->uop_class == UC_BRANCH || R->uop_class == UC_JALR) {
-            if ((rnd() % 100) < 30) { isbr[i] = 1; nbr++; }   /* 30% 會誤預測 -> 有 shadow */
+        /* 只有「block 結尾的分支」可以誤預測；比例 = -m。
+         * 這樣 .fe 的 FE_REDIRECT/FE_DIR_OK 才能跟 shadow_off 完全一致。 */
+        if (R->is_block_end &&
+            (R->uop_class == UC_BRANCH || R->uop_class == UC_JALR)) {
+            if ((int)(rnd() % 100) < mispct) { isbr[i] = 1; nbr++; }
         }
     }
     rec[N-1].flags |= BF_INTERVAL_END | BF_BLK_END;
@@ -103,7 +110,10 @@ int main(int argc, char **argv)
                 S->src1 = (uint8_t)(0x80 | (rnd() & 0x1F));
                 S->src2 = 0x3F;
                 S->dst  = (uint8_t)(0x80 | (rnd() & 0x1F));
-                if ((m % 5) == 4) { S->is_block_end = 1; S->flags |= BF_BLK_END; }
+                /* shadow 的 block 邊界固定每 4 筆一個 -> 每次誤預測剛好 D/4 個
+                 * wrong-path block，.fe.wp 的長度就是 nbr * (D/4)。
+                 * （.fe.wp 是 block 粒度，CONTRACT §19） */
+                if ((m % 4) == 3) { S->is_block_end = 1; S->flags |= BF_BLK_END; }
                 S->fe_index_delta = 0;      /* shadow 期間 .fe 游標凍結（v2 A1） */
                 S->mem_index_delta = 0;
             }
@@ -132,16 +142,30 @@ int main(int argc, char **argv)
     if (nsh) fwrite(sh, sizeof *sh, (size_t)nsh, f);
     fclose(f);
 
-    snprintf(p, sizeof p, "%s.fe", out); f = fopen(p, "wb");
-    for (i = 0; i < nblk; i++) {
-        unsigned char b = (unsigned char)(rnd() & 0x3);             /* bubbles */
-        if (rnd() & 1) b |= FE_UBTB_HIT;
-        if ((rnd() % 100) < 92) b |= FE_DIR_OK;                     /* 8% 方向錯 */
-        if (rnd() & 1) b |= FE_TGT_OK;
-        if ((rnd() % 100) < 25) b |= FE_REDIRECT;
-        fwrite(&b, 1, 1, f);
+    /* .fe 必須與 shadow_off 一致：block 的結尾分支帶 shadow <=> 該 block
+     * 的 fe byte 是 FE_REDIRECT & ~FE_DIR_OK。否則模型會在沒有 shadow 可跳的
+     * block 上要求跳 shadow（runtime 只能忽略），或反過來永遠不觸發。 */
+    {
+        unsigned char *feb = calloc((size_t)nblk, 1);
+        long blk = 0;
+        for (i = 0; i < N; i++) {
+            unsigned char b = (unsigned char)(rnd() & 0x3);         /* bubbles */
+            if (rnd() & 1) b |= FE_UBTB_HIT;
+            if (rnd() & 1) b |= FE_TGT_OK;
+            if (isbr[i]) b |= FE_REDIRECT;                          /* 方向預測錯 */
+            else         b |= FE_DIR_OK;
+            if (rec[i].is_block_end) { feb[blk] |= b; blk++; }
+            else                       feb[blk] |= (unsigned char)(b & ~FE_DIR_OK);
+        }
+        /* 沒有誤預測的 block 要確定 DIR_OK=1、REDIRECT=0 */
+        for (i = 0; i < nblk; i++)
+            if (!(feb[i] & FE_REDIRECT)) feb[i] |= FE_DIR_OK;
+            else                         feb[i] &= (unsigned char)~FE_DIR_OK;
+        snprintf(p, sizeof p, "%s.fe", out); f = fopen(p, "wb");
+        fwrite(feb, 1, (size_t)nblk, f);
+        fclose(f);
+        free(feb);
     }
-    fclose(f);
 
     snprintf(p, sizeof p, "%s.mem", out); f = fopen(p, "wb");
     for (i = 0; i < nmem; i++) {
@@ -154,12 +178,19 @@ int main(int argc, char **argv)
     }
     fclose(f);
 
-    snprintf(p, sizeof p, "%s.fe.wp", out); f = fopen(p, "wb");
-    for (i = 0; i < nsh; i++) {
-        unsigned char b = (unsigned char)((rnd() & 0x3) | FE_WRONGPATH);
-        fwrite(&b, 1, 1, f);
+    /* .fe.wp：每次誤預測 D_blk 個 byte（block 粒度），共 nbr * D_blk */
+    {
+        long dblk = (D + 3) / 4;          /* 每個 shadow 有幾個 wrong-path block */
+        long total = nbr * dblk;
+        snprintf(p, sizeof p, "%s.fe.wp", out); f = fopen(p, "wb");
+        for (i = 0; i < total; i++) {
+            unsigned char b = (unsigned char)((rnd() & 0x3) | FE_WRONGPATH);
+            fwrite(&b, 1, 1, f);
+        }
+        fclose(f);
+        printf("%s.fe.wp: %ld byte = %ld 次誤預測 x D=%ld block\n",
+               out, total, nbr, dblk);
     }
-    fclose(f);
 
     snprintf(p, sizeof p, "%s.mem.wp", out); f = fopen(p, "wb");
     for (i = 0; i < nsh; i++) { unsigned char b = (unsigned char)(rnd() & 0x33); fwrite(&b,1,1,f); }
@@ -172,8 +203,9 @@ int main(int argc, char **argv)
             seed, D, simpoint);
     fclose(f);
 
-    printf("%s: %ld rec, %ld blk, %ld mem, %ld shadow-rec (%ld branch x D=%d)\n",
-           out, N, nblk, nmem, nsh, nbr, D);
+    printf("%s: %ld rec, %ld blk, %ld mem, %ld shadow-rec "
+           "(%ld 誤預測分支 x D=%d = %.2f%% 的 block)\n",
+           out, N, nblk, nmem, nsh, nbr, D, 100.0 * (double)nbr / (double)nblk);
     free(rec); free(sh); free(isbr);
     return 0;
 }

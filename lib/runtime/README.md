@@ -60,6 +60,36 @@ ARCH= make      # 關掉 AVX2/BMI2，退回純量版（換平台時用）
 
 `include/bstf.h` 沒有寫死的地方，本 reader 採用的約定（要改請通知監督者）：
 
+### overlay 的粒度（CONTRACT §19 —— 四種 overlay，三種粒度）
+
+| 檔案 | 一個 byte / 一筆代表 | 長度怎麼驗 |
+|---|---|---|
+| `base.bstf` | 一條**指令**（`hdr.rec_bytes`） | `hdr.n_records` |
+| `.fe` | 一個 **fetch block** | `== hdr.n_fe_blocks` |
+| `.fe.wp` | 一個 **wrong-path fetch block** | `n_fe_wp % N == 0`，`D = n_fe_wp / N` |
+| `.mem` | 一次 **data 存取** | `== hdr.n_mem_access` |
+| `.mem.wp` | 一條 wrong-path 指令 | 沒有欄位可對，不檢查 |
+| `.imem` | 一個 fetch block | demo 不接線 |
+
+`N`（誤預測次數）= `.fe` 裡有 `FE_REDIRECT` 的 block 數，直接數出來。
+**選這個做法（監督者的方案 a）的理由**：不必解析 JSON、不改二進位格式，而且
+「長度必須是 N 的整數倍」比單純比大小強 —— 它同時抓到粒度錯誤與長度錯誤。
+另外它會被交叉驗證：帶 `shadow_off != 0` 的記錄數必須也等於 `N`
+（實測 CoreMark 1M：兩邊都是 15,581）。
+
+shadow 區的排版也用同一招推導，不讀 meta：
+
+```
+shadow_recs   = hdr.shadow_bytes / rec_bytes
+shadow_stride = shadow_recs / N          第 k 次誤預測佔記錄 [k*stride, (k+1)*stride)
+k             = (shadow_off - hdr.shadow_offset) / rec_bytes / shadow_stride
+.fe.wp 索引   = k * D + (在這個 shadow 裡走過幾個 block)
+```
+
+**`k` 一定要用 `stride` 除，不能用 `shadow_len` 除** —— `shadow_len` 只數真指令，
+後面補的是 `UC_NOP`（CoreMark 1M：stride=40 但 shadow_len 平均約 33）。
+實測從檔案推導出 `N=15581 / D=10 / stride=40`，與 Agent H 的 meta 完全一致。
+
 | 項目 | 本 reader 的約定 |
 |---|---|
 | 記錄長度 | **一律用 `hdr.rec_bytes`**，不用 `sizeof(bstf_rec_t)`；只要 `rec_bytes >= sizeof` 就能讀 |
@@ -75,17 +105,69 @@ ARCH= make      # 關掉 AVX2/BMI2，退回純量版（換平台時用）
 游標同時提供兩種模式：`rec_byte`（位元組，權威，未來換變長格式仍有效）與
 `bstf_cur_index()`（記錄索引，只在定長 + correct path 時有意義）。
 
-### `fb_redirect` / `fb_redir_shadow` 的語意（**top.v 沒有規定，本 runtime 自訂**）
+## 2b. wrong-path 的游標切換（CONTRACT §5【G2】）
 
-- `redir_shadow = 1`：跳到「游標**當下或之後**第一筆帶 shadow 的記錄」的 wrong-path，
-  staging 截到含該分支為止（分支之前的正確路徑指令不丟）。
-- `redir_shadow = 0`：丟掉還沒消耗的 wrong-path，回到該分支的下一筆。
+### 狀態機（每 lane）
 
-**為什麼是往前找**：`fe_event` 是 per-fetch-block 的，模型看到 `FE_REDIRECT`
-時觸發的分支通常是該 block 的最後一條、還沒被消耗。第一版往回找「最近一筆
-已消耗且有 shadow 的記錄」，實測會讓 correct-path 游標倒退而**永遠跑不完**
-（5,000,000 cycle 還在原地，78% 的 retire 是 wrong-path）。往前找可以保證每次
-redirect 至少跨過一個分支。**這個語意應該由 top.v 或 CONTRACT 規定** —— 已回報。
+```
+            fb_redirect & fb_redir_shadow
+   CORRECT ───────────────────────────────► SHADOW
+      ▲                                       │ 供完 shadow_len 筆
+      │  fb_redirect & ~fb_redir_shadow       ▼
+      └──────────────────────────────────── STARVED   (fb_valid = 0)
+                （後端 flush 到達）
+```
+
+`redir_shadow = 1` 時跳到「游標**當下或之後**第一筆帶 `shadow_off != 0` 的記錄」
+的 shadow 區。**不可**往回找「最近一筆已消耗且有 shadow 的記錄」—— 實測那個解讀
+會讓 correct-path 游標倒退而永遠跑不完（500 萬 cycle 原地打轉、78% 的 retire 是
+wrong-path）。
+
+搜尋範圍只限 **staging**（尚未交付的 `REFILL_M` 筆）＋**這一拍剛被 take 掉的那幾筆**。
+不往 staging 之外掃，否則為了找分支而推進游標會讓中間的 correct-path 指令
+永遠不被交付（靜默吃掉 trace）。實測 `nobranch = 0`，夠用。
+
+三條路徑：
+
+| 情況 | 處理 | 還原點 |
+|---|---|---|
+| (0) window 第 0 筆還在「剛解析完」的那個 block | 過期請求，忽略（`n_resolved`） | — |
+| (A) 分支還在 staging 裡 | staging 截到含分支為止，清掉它的 has-shadow 旗標 | 分支 + 1 |
+| (B) 分支在**同一拍**就被 `fb_take` 吃掉了 | staging 全丟 | max(分支+1, 最後交付那筆+1) |
+
+(B) 是必要的：`fb_take` 與 `fb_redirect` 是同一拍的輸出，模型看到該 block 的
+`fe_event` 時通常也一起消耗了那條分支。少了 (B)，實測 `nobranch` 會有 1,344 次
+（synth 20k）而完全測不到 wrong-path。
+
+(0) 也是必要的：還原點是分支 + 1，而分支本身可能在 flush **之後**才被交付
+（它比 shadow 早 fetch），此時模型會再看到同一個 block 的 `FE_REDIRECT`。
+不擋掉就會試圖重進同一個 shadow → 單調性斷言直接中止。
+
+### shadow 供完但 flush 還沒到 → STARVED
+
+停在 shadow 裡、`fb_valid` 全 0（等同前端斷流），游標**不動**。
+**不可以自己溜回正確路徑** —— 那會讓模型在還以為自己在推測時收到正確路徑的
+uop 並且把它們 retire 掉。這樣還原點也不會丟失。
+實測 CoreMark 1M：10,042 次誤預測裡有 8,389 次會 starve（mock 等 12 拍，
+而 shadow 的 ~32 筆在 take=4 之下 8 拍就吃完）。
+
+### 硬不變式（`BSTM_HARD_ASSERT`，違反直接 abort）
+
+游標倒退只會表現成「IPC 偏低」，不會自己現形，所以寧可中止：
+
+1. 每次進 shadow 的**分支位置嚴格遞增**
+2. 每次的**還原點嚴格遞增**
+3. `leave_shadow` 之後游標一定不在 shadow 裡
+
+`bstm_refill_check()` 另外驗證（測試與 CI 用）：
+
+4. 進 shadow 次數 == 離開次數 +（目前還在 shadow ? 1 : 0）
+5. `cp_consumed + wp_consumed == consumed`
+6. 跑完時 **`cp_consumed == hdr.n_records`** —— 每筆 correct-path 記錄恰好交付一次
+
+第 6 條是最強的一條：它同時排除「遺失」與「重複交付」。
+`test/unit/t_shadow.c` 附**負測**（`t_shadow --negative`）故意讓分支位置倒退，
+斷言子行程一定被訊號中止 —— 證明第 1 條不是空檢查（CONTRACT v7.1(2) 的要求）。
 
 ---
 
@@ -173,6 +255,27 @@ void  set_enable(void *st, uint64_t mask);    /* 可為 NULL */
 
 200 個 instance（100 config × 2 simpoint）→ 4 個 batch → 8 worker：
 **~390 M instance-cycles/s**，輸出 `build/sweep_mock.csv`。
+
+### wrong-path 實測（真 CoreMark trace，mock 模型，單 lane 指紋）
+
+| | CoreMark 1M | CoreMark 50M |
+|---|---|---|
+| `n_records` | 1,000,000 | 50,000,000 |
+| trace 裡的誤預測分支 | 15,581 | 625,800 |
+| **runtime 端到 window head 的誤預測** | **10,547 (67.7%)** | **445,640 (71.2%)** |
+| 模型實際觸發 `cnt_mispred` | 10,042 | 440,724 |
+| 進 / 離開 shadow | 10,042 / 10,042 | 440,724 / 440,724 |
+| STARVED 次數 | 8,389 | 359,287 |
+| `cp_consumed`（必須 == n_records） | 1,000,000 ✓ | 50,000,000 ✓ |
+| `wp_consumed` == `cnt_wrongpath` | 320,167 ✓ | 14,057,711 ✓ |
+| `cnt_retired`（只算 correct path） | 1,000,000 | 50,000,000 |
+| `cnt_st_refill`（原本恆為 0） | 25,826 | 1,105,360 |
+
+**跨過去沒被看到的 fetch block：1M 是 73,810 / 315,915 = 23.4%，
+50M 是 3,489,984 / 15,690,426 = 22.2%。**
+根因是 CONTRACT §5 的已知限制 G7：`fb_fe_event` 只帶 window 第 0 筆所屬 block
+的事件，4-wide window 一拍可以整個跨過一個 block（CoreMark 平均 3.2 指令/block）。
+**這代表模型最多只看得到 ~70% 的誤預測事件**，是誤預測懲罰能補回多少 IPC 的硬上限。
 
 ---
 

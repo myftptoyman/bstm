@@ -34,7 +34,7 @@ module be_rob (
     input  wire [`W*`ROB_W-1:0]  wb_robidx,
     output wire                  flush,
     output wire [`ROB_W-1:0]     flush_robidx,
-    output wire                  rob_full,     // v3: 剩餘空間 < W，回壓 be_dispatch
+    output wire [2:0]            rob_nfree,    // v8: 這拍還能收幾條（0..`W）
     output wire [`W-1:0]         cmt_valid,
     output wire [`W-1:0]         cmt_dv,
     output wire [`W*`ARF_W-1:0]  cmt_arf,
@@ -108,7 +108,12 @@ module be_rob (
         ent = {(4+ARFD_W+`PRF_W){1'b0}};
         for (cj = 0; cj < `W; cj = cj + 1) begin
             ent = rd_ent(h_idx);
-            if (!stop && (cj[2:0] < cfg_commit_width) && ent[3+ARFD_W+`PRF_W] && ent[2+ARFD_W+`PRF_W]) begin
+            // 一拍最多 commit cfg_commit_width 條，且**不得超過目前佔用數** ——
+            // cfg_rob_entries < cfg_commit_width 時 head 會在同一拍內繞回來，
+            // 若不擋就會把同一個 entry 重複 commit（v8 把 cfg 下限放回 1 之後才會踩到）
+            if (!stop && (cj[2:0] < cfg_commit_width)
+                      && ({{(`ROB_W-2){1'b0}}, cj[2:0]} < rob_cnt)
+                      && ent[3+ARFD_W+`PRF_W] && ent[2+ARFD_W+`PRF_W]) begin
                 if (ent[1+ARFD_W+`PRF_W]) begin
                     // 走到 wrong-path uop：不 retire，直接清管線
                     do_flush = 1'b1;
@@ -149,8 +154,11 @@ module be_rob (
 
     // v3：架構目的暫存器直接從 ROB entry 取出（RUOP_ARFD），不再有佔位
     assign cmt_arf = c_arf;
-    // ROB 剩餘空間 < W 就回壓（用本拍開始時的佔用，不看本拍的 commit → 保守 1 拍）
-    assign rob_full = (({1'b0, rob_cnt} + 8'd4) > {1'b0, cfg_rob_entries});
+    // v8 partial accept：回報「這拍能收幾條」而不是一個 full 位元。
+    // 只看本拍開始時的佔用（不看本拍的 commit）→ 保守 1 拍；
+    // **不依賴 ds_valid**，所以不會形成 valid<->ready 組合迴圈（CONTRACT v8 規則 2）。
+    wire [`ROB_W+1:0] rob_room = {1'b0, cfg_rob_entries} - {1'b0, rob_cnt};
+    assign rob_nfree = (rob_room >= {{(`ROB_W-1){1'b0}}, 3'd4}) ? 3'd4 : rob_room[2:0];
 
     // ---------------------------------------------- 時序
     always @(posedge clk) begin
@@ -195,8 +203,8 @@ module be_rob (
                             rob_done[wi] <= 1'b0;
                             rob_wp[wi]   <= duop[wk][`RUOP_WRONGPATH];
                             rob_dv[wi]   <= duop[wk][`RUOP_DV];
-                            rob_d[wi*`PRF_W +: `PRF_W] <= duop[wk][`RUOP_D];
-                            rob_a[wi*ARFD_W +: ARFD_W]           <= duop[wk][`RUOP_ARFD];
+                            rob_d[wi*`PRF_W +: `PRF_W] <= duop[wk][`RUOP_D +: `PRF_W];
+                            rob_a[wi*ARFD_W +: ARFD_W]           <= duop[wk][`RUOP_ARFD +: `RUOP_ARFD_W];
                         end
                 end
             end

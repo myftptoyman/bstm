@@ -143,11 +143,47 @@ int bstf_open_ex(bstf_trace_t *t, const char *base, int mode)
     t->mem = map_file(p, &l, 0); t->n_mem = l;
     if (check_size(".mem", t->n_mem, t->hdr->n_mem_access, lax) < 0) { bstf_close(t); return -1; }
 
+    /* .fe.wp 是 **block** 粒度（CONTRACT §19），不是指令粒度。
+     * 檔頭沒有 D，所以用方案 (a)：從 .fe 數 FE_REDIRECT 得到誤預測次數 N，
+     * 然後要求 n_fe_wp 是 N 的整數倍，商就是 D。
+     * 這比單純比大小強：它同時驗證了「長度是誤預測次數的整數倍」。 */
+    t->shadow_recs = t->rec_bytes ? t->hdr->shadow_bytes / t->rec_bytes : 0;
+    if (t->fe) {
+        uint64_t i;
+        for (i = 0; i < t->n_fe; i++) if (t->fe[i] & FE_REDIRECT) t->n_mispred++;
+    }
     snprintf(p, sizeof p, "%s.fe.wp", base);
     t->fe_wp = map_file(p, &l, 0);  t->n_fe_wp  = l;
-    if (t->fe_wp && check_size(".fe.wp", t->n_fe_wp,
-                               t->hdr->shadow_bytes / t->rec_bytes, lax) < 0)
-        { bstf_close(t); return -1; }
+    if (t->fe_wp) {
+        if (t->n_mispred == 0) {
+            snprintf(g_err, sizeof g_err,
+                     ".fe.wp 有 %llu byte，但 .fe 裡沒有任何 FE_REDIRECT",
+                     (unsigned long long)t->n_fe_wp);
+            if (!lax) { bstf_close(t); return -1; }
+        } else if (t->n_fe_wp % t->n_mispred) {
+            snprintf(g_err, sizeof g_err,
+                     ".fe.wp 長度 %llu 不是誤預測次數 %llu 的整數倍"
+                     "（.fe.wp 是 block 粒度，D = 長度/次數）",
+                     (unsigned long long)t->n_fe_wp, (unsigned long long)t->n_mispred);
+            if (!lax) { bstf_close(t); return -1; }
+        } else {
+            t->fe_wp_depth = t->n_fe_wp / t->n_mispred;
+        }
+    }
+    /* shadow 區的 stride（記錄數）。shadow_len 只數「真指令」，後面是 UC_NOP
+     * padding，所以 k = wp_idx / stride，不是 wp_idx / shadow_len。 */
+    if (t->n_mispred && t->shadow_recs) {
+        if (t->shadow_recs % t->n_mispred) {
+            snprintf(g_err, sizeof g_err,
+                     "shadow 記錄數 %llu 不是誤預測次數 %llu 的整數倍"
+                     "（無法推導 stride）",
+                     (unsigned long long)t->shadow_recs,
+                     (unsigned long long)t->n_mispred);
+            if (!lax) { bstf_close(t); return -1; }
+        } else {
+            t->shadow_stride = t->shadow_recs / t->n_mispred;
+        }
+    }
 
     snprintf(p, sizeof p, "%s.mem.wp", base);
     t->mem_wp = map_file(p, &l, 0); t->n_mem_wp = l;
@@ -234,9 +270,17 @@ int bstf_enter_shadow(const bstf_trace_t *t, bstf_cursor_t *c)
     c->rec_byte    = r->shadow_off;
     c->in_shadow   = 1;
     c->shadow_left = r->shadow_len;
-    /* .fe.wp / .mem.wp 的索引 = 這筆 shadow 記錄在 shadow 區裡的序號 */
+    /* shadow 區裡的記錄序號（.mem.wp 用，指令粒度） */
     c->wp_idx = (t->hdr->shadow_offset && r->shadow_off >= t->hdr->shadow_offset)
               ? (r->shadow_off - t->hdr->shadow_offset) / t->rec_bytes : 0;
+    /* .fe.wp 用：k = 誤預測序號 = shadow 記錄序號 / stride，基底 = k*D。
+     * 用 stride 而不是 shadow_len —— shadow_len 只數真指令，後面有 padding。 */
+    c->wp_fe_blk  = 0;
+    {
+        uint64_t stride = t->shadow_stride ? t->shadow_stride : r->shadow_len;
+        c->wp_fe_base = (stride && t->fe_wp_depth)
+                      ? (c->wp_idx / stride) * t->fe_wp_depth : 0;
+    }
     return 1;
 }
 
@@ -250,6 +294,8 @@ void bstf_leave_shadow(const bstf_trace_t *t, bstf_cursor_t *c)
     c->in_shadow   = 0;
     c->shadow_left = 0;
     c->wp_idx      = 0;
+    c->wp_fe_base  = 0;
+    c->wp_fe_blk   = 0;
 }
 
 /* ---------------- 欄位打包 ---------------- */
