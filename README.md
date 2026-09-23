@@ -92,17 +92,25 @@ rule 1 exists.
 **Integrated model** — 4-issue OOO, 10 stages, ROB 64 / IQ 32 / LDQ-STQ 16 / MSHR 8 / PRF 64:
 
 ```
-ooo_top:  38,549 cells   0 memories   0 latches   0 variable shifts
-          139,924 nets  →  3,432 slots   (40.8x liveness compression)
-          141,317 bitwise ops per target cycle
-          working set:  27 KB slots + 77 KB state = 104 KB   (target was < 512 KB)
+ooo_top:  29,844 cells   0 memories   0 latches   0 variable shifts
+          104,061 nets  →  3,306 slots   (31.5x liveness compression)
+          112,857 bitwise ops per target cycle
+          working set:  26 KB slots + 72 KB state = 98 KB    (target was < 512 KB)
+
+gate-level (synth -flatten; abc -g AND,OR,XOR,NAND,NOR,XNOR):
+          148,046 gates   8,158 flops   156,204 total cells
 ```
 
-Verified **bit-exact against Verilator on the real 38,549-cell model**, cycle by cycle,
+Measured with `proc; flatten; opt; memory -nomap; opt -full` then `write_json` —
+bstm-cc needs a flattened word-level netlist and must not see techmap or abc.
+Gate-level numbers come from `ci/gate_count.sh`, which is a different flow; the two
+are not comparable to each other (PLAN §16 records why cell count is a bad cost proxy).
+
+Verified **bit-exact against Verilator on the real model**, cycle by cycle,
 every output bit. The equivalence harness also randomly asserts reset, so the reset
 path is always exercised.
 
-**Backend comparison** — four ways to turn 141,317 ops/cycle into something runnable:
+**Backend comparison** — four ways to turn ~113 K ops/cycle into something runnable:
 
 | backend | compile | target-cycles/s | ops/s |
 |---|---|---|---|
@@ -174,30 +182,49 @@ stall breakdown        cycles      share
   mshr                      0       0 %     <- CoreMark fits in L1D
 ```
 
-**This number is an upper bound**, and knowing why matters more than the number: wrong-path
-shadow expansion is not implemented yet (`shadow_off` is 0 everywhere), so no misprediction
-penalty is ever paid. With a 4.93 % block mispredict rate and a ~12-cycle penalty, the true
-figure is likely nearer 1.0–1.1.
+**Wrong-path is now in the loop.** The number above was measured before wrong-path shadow
+expansion existed, so no misprediction penalty was ever paid. Feeding the shadow through
+`lib/runtime/refill.c`, on the full 1 M-instruction trace at the best configuration found so
+far (PRF 96 / ROB 128 / LSQ 32 / IQ 64):
+
+| | IPC | cycles for 1 M instructions | misprediction redirects |
+|---|---:|---:|---:|
+| no wrong-path | 1.497 | 668,051 | 0 |
+| **wrong-path** | **1.263** | 791,915 | 10,732 |
+
+That 15.6 % is a *lower* bound on the penalty, for a reason given under "what is still
+missing" below: `fb_fe_event` is a single 8-bit port carrying only the window's slot-0 fetch
+block, so 4.4 % of blocks are stepped over entirely and the model acts on 10,732 of the
+trace's 15,581 shadow-bearing branches — 68.9 % coverage.
 
 ### The physical register sweep, and why it mattered
 
-The stall table above looks like it says "rename is the bottleneck, the PRF is too small."
-That reading is wrong, and the sweep that tested it is the most useful thing this model has
-produced so far:
+**Retraction.** An earlier revision of this file published a PRF 64/96/128/256 table and
+called it "the most useful thing this model has produced". Those rows above 64 were not
+measured on the integrated model. `RUOP_S1/S2/D` were hardcoded 6-bit ranges while rename
+wrote `` `PRF_W ``-wide values into them, so every physical register number ≥ 64 was silently
+truncated and aliased; the integrated model could not represent one. The table came from an
+agent's scratch tree, where per-config `ifc.vh` files had been hand-edited to widen `RUOP_W`
+to 48 — a re-layout that never reached the repository. Lint does not warn on implicit width
+truncation, and the free-list self-test never goes through the RUOP encoding, so nothing
+failed. See CONTRACT §20; the field bases are now computed from `` `PRF_W ``.
 
-| PRF | IPC | rename stall<br>(freelist) | ROB stall | ROB occupancy |
-|---|---|---:|---:|---:|
-| 64 | 1.381 | 61,457 | 141 | 28.5 |
-| 96 | 1.391 | 2,936 | 37,509 | 34.1 |
-| 128 | 1.391 | **0** | 40,445 | 34.1 |
-| 256 | 1.391 | **0** | 40,445 | 34.1 |
+Re-measured on the integrated model, real CoreMark, 500 K cycles, ROB 64 / LSQ 16 / IQ 32:
 
-**Quadrupling the physical register file moves IPC by 0.7 %.** Everything from 96 upwards is
-bit-identical, which was predicted from first principles before the sweep ran: live physical
-registers are bounded by 32 committed architectural mappings plus at most `ROB_N` = 64
-in-flight destinations, so 96 saturates by construction.
+| PRF | IPC (wrong-path) | IPC (no wrong-path) | freelist stall | ROB occupancy |
+|---|---:|---:|---:|---:|
+| 64 | 1.240 | 1.435 | 20,757 | 25.1 |
+| 96 | 1.269 | 1.447 | **0** | 26.5 |
+| 128 | 1.269 | 1.447 | 0 | 26.5 |
+| 192 | 1.269 | 1.447 | 0 | 26.5 |
+| 256 | 1.269 | 1.447 | 0 | 26.5 |
 
-The stall attribution was the problem, not the register file:
+Freelist pressure reaches exactly zero at **96**, matching the first-principles bound that
+was derived before any sweep ran: live physical registers are bounded by 32 committed
+architectural mappings plus at most `ROB_N` = 64 in-flight destinations. Everything from 96
+upwards is bit-identical. Quadrupling the register file beyond that moves nothing.
+
+The stall attribution was a separate, real bug, fixed earlier:
 
 ```verilog
 // rn_rename.v
@@ -210,15 +237,25 @@ assign rn_ready = ~blocked & ~flush;
 
 A full IQ, LSQ, ROB or MSHR all lower `rn_ready`, and every one of those cycles was booked
 against rename — double-counted with the downstream counters that already recorded them.
-With the attribution fixed, freelist pressure reaches exactly zero at PRF 128, matching the
-first-principles bound. The earlier "stall stays at 245,580 regardless of PRF" reading was
-entirely an artefact of the counter.
+**A miscounted stall does not merely give the wrong number — it hides the trend, which is the
+thing design-space exploration exists to find.**
 
-What the corrected sweep actually shows is a textbook Amdahl result: removing the rename
-bottleneck pushes pressure downstream, ROB stalls go from 141 cycles to 40,445 and ROB
-occupancy from 28.5 to 34.1, and IPC barely moves because the LSQ and IQ are waiting behind
-it. **A miscounted stall does not merely give the wrong number — it hides the trend, which
-is the thing design-space exploration exists to find.**
+### Sweeping the rest, with wrong-path on
+
+Real CoreMark, 500 K cycles. Every row is the same source built with different `` `define ``s;
+ROB/LSQ/IQ also move at runtime through the `cfg_*` ports.
+
+| config | IPC (wrong-path) | IPC (no wp) | ROB occ | IQ stall | LSQ stall | backpressure |
+|---|---:|---:|---:|---:|---:|---:|
+| PRF 64 / ROB 64 / LSQ 16 / IQ 32 | 1.240 | 1.435 | 25.1 | 63,265 | 67,915 | 130,485 |
+| PRF 96 | 1.269 | 1.447 | 26.5 | 63,327 | 71,152 | 138,894 |
+| PRF 96 + ROB 128 | 1.276 | 1.451 | 26.4 | 63,419 | 71,474 | 134,180 |
+| PRF 96 + LSQ 32 | 1.299 | 1.473 | 31.2 | 122,103 | **2,521** | 133,043 |
+| PRF 96 + IQ 64 | 1.271 | 1.448 | 30.3 | **0** | 89,893 | 119,475 |
+| **all of the above** | **1.310** | 1.483 | 38.8 | 45,190 | 68,926 | 114,055 |
+
+Every row is bottleneck *transfer*, not elimination. IQ 64 drives IQ stalls to zero and hands
+the whole amount to the LSQ; LSQ 32 does the mirror image. Opening all four buys 5.6 %.
 
 Chasing it further turned up two more measurement problems, neither of which is a bug in the
 model:
